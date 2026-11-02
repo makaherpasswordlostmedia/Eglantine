@@ -733,7 +733,8 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
         }
         case 0xb82: { // LDC.64 indexed byte offset
             const u32 width = insn.Bits(73, 3);
-            if ((width != 4 && width != 5) || insn.Bits(78, 2) || insn.Bits(91, 1) ||
+            // Sizes 0-3 (U8, S8, U16, S16) and 4/5 (32, 64) share Maxwell LDC's size encoding.
+            if (width > 5 || insn.Bits(78, 2) || insn.Bits(91, 1) ||
                 bank() >= 18 ||
                 (width == 5 && ((dest & 1) || dest >= 254))) return fail(index, "native indexed constant load mode");
             emit(base(0xef90000000000000ULL) | (u64{insn.Bits(24, 8)} << 8) |
