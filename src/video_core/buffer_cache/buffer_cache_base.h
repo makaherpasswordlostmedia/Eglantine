@@ -57,7 +57,9 @@ constexpr u32 NUM_VERTEX_BUFFERS = 32;
 constexpr u32 NUM_TRANSFORM_FEEDBACK_BUFFERS = 4;
 constexpr u32 NUM_GRAPHICS_UNIFORM_BUFFERS = 18;
 constexpr u32 NUM_COMPUTE_UNIFORM_BUFFERS = 8;
-constexpr u32 NUM_STORAGE_BUFFERS = 16;
+// Must cover Shader::Info::MAX_SSBOS (32); enabled/written masks are u32.
+constexpr u32 NUM_STORAGE_BUFFERS = 32;
+static_assert(NUM_STORAGE_BUFFERS <= 32, "SSBO masks are 32-bit");
 constexpr u32 NUM_TEXTURE_BUFFERS = 32;
 constexpr u32 NUM_STAGES = 5;
 
@@ -284,8 +286,8 @@ public:
 
     void UnbindComputeStorageBuffers();
 
-    void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                  bool is_written);
+    [[nodiscard]] bool BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
+                                                bool is_written);
 
     void UnbindComputeTextureBuffers();
 

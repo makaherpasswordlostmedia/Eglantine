@@ -86,8 +86,8 @@ void ComputePipeline::Configure() {
     size_t ssbo_index{};
     for (const auto& desc : info.storage_buffers_descriptors) {
         ASSERT(desc.count == 1);
-        buffer_cache.BindComputeStorageBuffer(ssbo_index, desc.cbuf_index, desc.cbuf_offset,
-                                              desc.is_written);
+        [[maybe_unused]] const bool bound = buffer_cache.BindComputeStorageBuffer(
+            ssbo_index, desc.cbuf_index, desc.cbuf_offset, desc.is_written);
         ++ssbo_index;
     }
     texture_cache.SynchronizeDescriptors(true);

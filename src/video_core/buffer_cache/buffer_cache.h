@@ -482,6 +482,11 @@ void BufferCache<P>::UnbindGraphicsStorageBuffers(size_t stage) {
 template <class P>
 bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, u32 cbuf_index,
                                                u32 cbuf_offset, bool is_written) {
+    if (ssbo_index >= NUM_STORAGE_BUFFERS) [[unlikely]] {
+        LOG_ERROR(HW_GPU, "Graphics storage buffer index {} exceeds maximum storage buffer count",
+                  ssbo_index);
+        return false;
+    }
     const bool already_enabled =
         ((channel_state->enabled_storage_buffers[stage] >> ssbo_index) & 1U) != 0;
     if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
@@ -544,12 +549,20 @@ void BufferCache<P>::UnbindComputeStorageBuffers() {
 }
 
 template <class P>
-void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
+bool BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
                                               bool is_written) {
+    // A dropped binding leaves the pipeline with fewer descriptors than it was built for, and the
+    // descriptor update then reads uninitialised queue entries. Report failure so the caller skips
+    // the dispatch instead of submitting it.
     if (ssbo_index >= channel_state->compute_storage_buffers.size()) [[unlikely]] {
         LOG_ERROR(HW_GPU, "Storage buffer index {} exceeds maximum storage buffer count",
                   ssbo_index);
-        return;
+        return false;
+    }
+    const auto& launch_desc = kepler_compute->launch_description;
+    if (((launch_desc.const_buffer_enable_mask >> cbuf_index) & 1) == 0) {
+        LOG_WARNING(HW_GPU, "Skipped binding SSBO: cbuf index {} is not enabled", cbuf_index);
+        return false;
     }
     const bool already_enabled =
         ((channel_state->enabled_compute_storage_buffers >> ssbo_index) & 1U) != 0;
@@ -560,7 +573,7 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
                 LOG_WARNING(HW_GPU,
                             "Skipping compute storage buffer {} due to driver limit {}",
                             ssbo_index, max_bindings);
-                return;
+                return false;
             }
         }
     }
@@ -572,17 +585,11 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
         }
     }
 
-    const auto& launch_desc = kepler_compute->launch_description;
-    if (((launch_desc.const_buffer_enable_mask >> cbuf_index) & 1) == 0) {
-        LOG_WARNING(HW_GPU, "Skipped binding SSBO: cbuf index {} is not enabled", cbuf_index);
-        return;
-    }
-    ASSERT(((launch_desc.const_buffer_enable_mask >> cbuf_index) & 1) != 0);
-
     const auto& cbufs = launch_desc.const_buffer_config;
     const GPUVAddr ssbo_addr = cbufs[cbuf_index].Address() + cbuf_offset;
     channel_state->compute_storage_buffers[ssbo_index] =
         StorageBufferBinding(ssbo_addr, cbuf_index, is_written);
+    return true;
 }
 
 template <class P>
