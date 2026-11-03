@@ -199,6 +199,9 @@ void ApplyNx2Characteristics(GC& gc) {
     gc.gpfifo_class = 0xC56F;      // AMPERE_CHANNEL_GPFIFO_A
     gc.dma_copy_class = 0xC7B5;    // AMPERE_DMA_COPY_B
     gc.chipname = 0x6631306167;    // "ga10f"
+    // NvRm filters the class inventory using these engine capability bits.
+    gc.flags |= 1ULL << 34; // SUPPORT_MAPPING_MODIFY: incompressible kind updates
+    gc.flags |= (1ULL << 41) | (1ULL << 42); // SUPPORT_3D | SUPPORT_COMPUTE
     gc.flags |= 0x100;             // NVGPU_GPU_FLAGS_SUPPORT_TSG: NvRm binds channels to a TSG
     gc.flags |= 1ULL << 22;        // NVGPU_GPU_FLAGS_SUPPORT_TSG_SUBCONTEXTS (see below)
     gc.flags |= 1ULL << 26;        // NVGPU_GPU_FLAGS_SUPPORT_SYNCPOINT_ADDRESS: syncpoint shim
@@ -207,6 +210,16 @@ void ApplyNx2Characteristics(GC& gc) {
     // Without the flag NvRm fails that call and the texture stays at GPU address 0 (title 1's
     // movie and the passes rendered into compressible pools never showed).
     gc.flags |= 1ULL << 34;
+
+    // Bits 40..43: the 2D, 3D, compute and inline-to-memory class families. The SDK filters its
+    // class enumeration by them; without them Fire Emblem: Fortune's Weave aborts at boot.
+
+
+    // Bits 40..43: some NVN2 drivers (e.g. the Yoshi demo's) filter the 2D/3D/compute/inline
+    // engine classes with these before picking their contexts. Without them NVN2Manager::
+    // CreateDevice fails (2162-0001) right after GetEngineInfo. Values from the NS2 patch.
+
+    gc.flags |= 0xfULL << 40;
 
     // The Switch 2 layout keeps nine s16 interface versions at 0x70..0x80 (like nvgpu's
     // *_ioctl_nr_last); its NvRm requires e.g. [0x78] >= 6 and enables features above 0xa, 0x1f
@@ -320,6 +333,7 @@ NvResult nvhost_ctrl_gpu::GetCharacteristics3(
         nx2_caller = true;
         g_nx2_driver = true;
         Tegra::g_nx2_ampere = true;
+        Tegra::g_nx2_program_id = system.GetApplicationProcessProgramID();
         ApplyNx2Characteristics(params.gc);
         params.gpu_characteristics_buf_size = Nx2CharacteristicsSize;
         LOG_WARNING(Service_NVDRV, "Switch 2 caller, reporting Ampere chip 0x17E");

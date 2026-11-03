@@ -244,6 +244,7 @@
     <string name="update_install_failed">Failed to install update: %1$s</string>
     <string name="home_search">Search</string>
     <string name="home_settings">Settings</string>
+    <string name="loose_dump_all_files_access">Allow All files access so extracted games (exefs/romfs folders) in your game folders can be opened</string>
     <string name="empty_gamelist">No files were found or no game directory has been selected yet.</string>
     <string name="manage_game_folders">Manage game folders</string>
     <string name="select_games_folder_description">Allows Eden to populate the games list</string>
@@ -594,7 +595,7 @@
     <string name="skip_cpu_inner_invalidation">Skip CPU Inner Invalidation</string>
     <string name="skip_cpu_inner_invalidation_description">Skips certain CPU-side cache invalidations during memory updates, reducing CPU usage and improving it\'s performance. This may cause glitches or crashes on some games.</string>
     <string name="fix_bloom_effects">Fix Bloom Effects</string>
-    <string name="fix_bloom_effects_description">Reduces bloom blur in LA/EOW (Adreno A6XX - A7XX/ Turnip), removes bloom in Burnout. Warning: may cause graphical artifacts in other games.</string>
+    <string name="fix_bloom_effects_description">Removes bloom in Burnout.</string>
     <string name="emulate_bgr565">Emulate BGR565</string>
     <string name="emulate_bgr565_description">Fixes problems with inverted colors in games or strange artifacts or strange shadows.</string>
     <string name="rescale_hack">Enable Legacy Rescale Pass</string>

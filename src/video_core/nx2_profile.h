@@ -51,6 +51,12 @@ enum class Zone : u32 {
     Method,       ///< Engine method calls (what a split GPU thread's back half would run)
     SplitDrain,   ///< Split GPU thread: the front waits for the back (gpu_split.h)
     SplitWait,    ///< Split GPU thread: the back waits for work
+    DrainAcquire, ///< Split drains by cause: semaphore acquires and reads (puller)
+    DrainPbFlush, ///< Pushbuffer parameter flushes
+    DrainSync,    ///< Synced command lists
+    DrainWritten, ///< Guest writes to command words
+    DrainDmaRead, ///< Front MME DMA reads
+    DrainRelease, ///< Reads of pending releases
     Count,
 };
 
@@ -61,7 +67,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "sync descriptors", "read handles", "fill image views", "texture buffers", "update buffers",
     "descriptor acquire", "bind stage buffers", "push descriptors", "render targets",
     "configure draw", "dynamic state", "draw record", "texture upload", "fence",
-    "fence skipped", "method", "split drain", "split wait",
+    "fence skipped", "method", "split drain", "split wait", "drain acquire", "drain pbflush",
+    "drain sync", "drain written", "drain dma read", "drain release",
 };
 
 // Read once at startup: Enabled() runs several times per method write (no guard to check).
@@ -87,21 +94,43 @@ struct ThreadData {
 
 inline thread_local ThreadData t_data;
 
+// The zones wrap hot paths (~150,000 times a second): when profiling is off a scope must cost a
+// flag test, so the timing work stays out of line.
 class Scope {
 public:
     explicit Scope(Zone zone_) : zone{zone_}, enabled{Enabled()} {
-        if (!enabled) {
-            return;
+        if (enabled) [[unlikely]] {
+            Begin();
         }
+    }
+
+    ~Scope() {
+        if (enabled) [[unlikely]] {
+            End();
+        }
+    }
+
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+
+private:
+#ifdef _MSC_VER
+    __declspec(noinline)
+#else
+    __attribute__((noinline))
+#endif
+    void Begin() {
         parent_child_ns = t_data.child_ns;
         t_data.child_ns = 0;
         start = Now();
     }
 
-    ~Scope() {
-        if (!enabled) {
-            return;
-        }
+#ifdef _MSC_VER
+    __declspec(noinline)
+#else
+    __attribute__((noinline))
+#endif
+    void End() {
         const u64 elapsed = Now() - start;
         auto& data = t_data;
         const auto index = static_cast<size_t>(zone);
@@ -110,10 +139,6 @@ public:
         data.child_ns = parent_child_ns + elapsed;
     }
 
-    Scope(const Scope&) = delete;
-    Scope& operator=(const Scope&) = delete;
-
-private:
     Zone zone;
     bool enabled;
     u64 start{};

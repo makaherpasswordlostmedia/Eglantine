@@ -75,6 +75,8 @@ add_library(video_core STATIC
     host1x/codec_types.h
     host1x/ffmpeg.cpp
     host1x/ffmpeg.h
+    host1x/native_video.cpp
+    host1x/native_video.h
     host1x/control.cpp
     host1x/control.h
     host1x/gpu_device_memory_manager.cpp
@@ -197,6 +199,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_resource_pool.h
     renderer_vulkan/vk_scheduler.cpp
     renderer_vulkan/vk_scheduler.h
+    renderer_vulkan/vk_shader_reuse.cpp
+    renderer_vulkan/vk_shader_reuse.h
     renderer_vulkan/vk_shader_util.cpp
     renderer_vulkan/vk_shader_util.h
     renderer_vulkan/vk_staging_buffer_pool.cpp

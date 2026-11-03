@@ -9,6 +9,8 @@
 #include <tuple>
 #include <mutex>
 #include <map>
+#include <set>
+#include <string>
 #include <chrono>
 #include <algorithm>
 #include <cstdlib>
@@ -18,7 +20,10 @@
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/hle/ipc.h"
+#include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/memory.h"
+#include "core/hle/kernel/k_process.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/service.h"
 #include "core/hle/service/nx2_stub_interface.h"
@@ -67,6 +72,26 @@ void ServiceFrameworkBase::RegisterHandlersBaseTipc(const FunctionInfoBase* func
 
 void ServiceFrameworkBase::ReportUnimplementedFunction(HLERequestContext& ctx,
                                                        const FunctionInfoBase* info) {
+    // EDEN_NX2_AUTO_STUB=1 auto-stubs every unknown command without touching the config. Switch 2
+    // programs are always auto-stubbed: they still call many commands nobody has implemented.
+    static const bool env_auto_stub = std::getenv("EDEN_NX2_AUTO_STUB") != nullptr;
+    const auto* const caller = ctx.GetThread().GetOwnerProcess();
+    const bool auto_stub = Settings::values.use_auto_stub || env_auto_stub ||
+                           std::string_view{service_name}.starts_with(Nx2StubPrefix) ||
+                           (caller != nullptr && caller->IsSwitch2());
+    // Auto-stubbed commands are reported once each: title 1 polls nx2:camera 29 every frame
+    // (~47 calls a second), and every report wrote a Critical line, which flushes the log file.
+    if (auto_stub) {
+        static std::mutex reported_mutex;
+        static std::set<std::pair<std::string, u32>> reported;
+        std::scoped_lock lk{reported_mutex};
+        if (!reported.emplace(service_name, ctx.GetCommand()).second) {
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(ResultSuccess);
+            return;
+        }
+    }
+
     auto cmd_buf = ctx.CommandBuffer();
     std::string function_name = info == nullptr ? "<unknown>" : info->name;
 
@@ -80,20 +105,55 @@ void ServiceFrameworkBase::ReportUnimplementedFunction(HLERequestContext& ctx,
 
     system.GetReporter().SaveUnimplementedFunctionReport(ctx, ctx.GetCommand(), function_name, service_name);
     UNIMPLEMENTED_MSG("Unknown / unimplemented {}", fmt::to_string(buf));
-    // EDEN_NX2_AUTO_STUB=1 auto-stubs every unknown command without touching the config. Switch 2
-    // programs are always auto-stubbed: they still call many commands nobody has implemented.
-    static const bool env_auto_stub = std::getenv("EDEN_NX2_AUTO_STUB") != nullptr;
-    const auto* const caller = ctx.GetThread().GetOwnerProcess();
-    if (Settings::values.use_auto_stub || env_auto_stub ||
-        std::string_view{service_name}.starts_with(Nx2StubPrefix) ||
-        (caller != nullptr && caller->IsSwitch2())) {
-        LOG_WARNING(Service, "Using auto stub fallback!");
+    if (auto_stub) {
+        LOG_WARNING(Service, "Using auto stub fallback (repeats of this command are not logged)");
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 }
 
+namespace {
+void TraceHidRequest(const std::string& service, HLERequestContext& ctx) {
+    static const bool enabled = std::getenv("EDEN_NX2_HID_TRACE") != nullptr;
+    if (!enabled || service != "hid") {
+        return;
+    }
+    fmt::memory_buffer trace;
+    fmt::format_to(std::back_inserter(trace), "hid trace cmd={} tipc={} x={} a={} b={} c={}",
+                   ctx.GetCommand(), ctx.IsTipc(), ctx.BufferDescriptorX().size(),
+                   ctx.BufferDescriptorA().size(), ctx.BufferDescriptorB().size(),
+                   ctx.BufferDescriptorC().size());
+    for (const auto& descriptor : ctx.BufferDescriptorX()) {
+        fmt::format_to(std::back_inserter(trace), " X({:#x}@{:#x})", descriptor.Size(),
+                       descriptor.Address());
+    }
+    for (const auto& descriptor : ctx.BufferDescriptorA()) {
+        fmt::format_to(std::back_inserter(trace), " A({:#x}@{:#x})", descriptor.Size(),
+                       descriptor.Address());
+    }
+    for (const auto& descriptor : ctx.BufferDescriptorB()) {
+        fmt::format_to(std::back_inserter(trace), " B({:#x}@{:#x})", descriptor.Size(),
+                       descriptor.Address());
+    }
+    for (const auto& descriptor : ctx.BufferDescriptorC()) {
+        fmt::format_to(std::back_inserter(trace), " C({:#x}@{:#x})", descriptor.Size(),
+                       descriptor.Address());
+    }
+    fmt::format_to(std::back_inserter(trace), " words:");
+    for (u32 index = 0; index < 12; ++index) {
+        fmt::format_to(std::back_inserter(trace), " {:#x}", ctx.CommandBuffer()[index]);
+    }
+    const auto payload = ctx.ReadBufferCopy();
+    fmt::format_to(std::back_inserter(trace), " payload({:#x}):", payload.size());
+    for (std::size_t i = 0; i < std::min<std::size_t>(payload.size(), 32); ++i) {
+        fmt::format_to(std::back_inserter(trace), " {:02x}", payload[i]);
+    }
+    LOG_INFO(Service, "{}", fmt::to_string(trace));
+}
+} // Anonymous namespace
+
 void ServiceFrameworkBase::InvokeRequest(HLERequestContext& ctx) {
+    TraceHidRequest(service_name, ctx);
     auto it = handlers.find(ctx.GetCommand());
     FunctionInfoBase const* info = it == handlers.end() ? nullptr : &it->second;
     if (info == nullptr || info->handler_callback == nullptr)
@@ -169,11 +229,70 @@ void CountRequest(const std::string& service, u32 command, u32 type, u32 result)
     LOG_INFO(Service, "ipc summary ({} kinds){}", lines.size(), text);
     counts.clear();
 }
+std::mutex in_flight_mutex;
+std::map<u64, std::string> in_flight;
 } // Anonymous namespace
+
+void LogInFlightRequests() {
+    std::scoped_lock lk{in_flight_mutex};
+    for (const auto& [thread_id, what] : in_flight) {
+        LOG_INFO(Service, "  in-flight request from thread {}: {}", thread_id, what);
+    }
+}
+
+// Diagnostic: logs every thread of the application with its state, wait reason, PC, LR and a
+// frame-pointer backtrace, to find what a stalled game waits on. Addresses are guest virtual (see
+// the LoadModule lines).
+void DumpGuestThreads(Core::System& system, std::string_view reason) {
+    auto* process = system.ApplicationProcess();
+    if (!process) {
+        return;
+    }
+    auto& memory = process->GetMemory();
+    LOG_INFO(Service, "Thread dump at {}", reason);
+    for (auto& thread : process->GetThreadList()) {
+        const auto& context = thread.GetContext();
+        std::string frames;
+        u64 fp = context.fp;
+        for (int depth = 0; depth < 16 && fp != 0 && (fp & 0xf) == 0 &&
+                            memory.IsValidVirtualAddressRange(fp, 16);
+             ++depth) {
+            const u64 next = memory.Read64(fp);
+            const u64 lr = memory.Read64(fp + 8);
+            frames += fmt::format(" {:#x}", lr);
+            if (next <= fp) {
+                break;
+            }
+            fp = next;
+        }
+        LOG_INFO(Service,
+                 "  thread {} prio {} core {} state {:#x} wait {} pc {:#x} lr {:#x} sp {:#x} "
+                 "x0 {:#x} x1 {:#x} x2 {:#x} |{}",
+                 thread.GetThreadId(), thread.GetPriority(), thread.GetActiveCore(),
+                 static_cast<u32>(thread.GetRawState()),
+                 static_cast<u32>(thread.GetWaitReasonForDebugging()), context.pc, context.lr,
+                 context.sp, context.r[0], context.r[1], context.r[2], frames);
+    }
+    LogInFlightRequests();
+}
 
 Result ServiceFrameworkBase::HandleSyncRequest(Kernel::KServerSession& session,
                                                HLERequestContext& ctx) {
+    const u64 requester = ctx.GetThread().GetThreadId();
+    {
+        std::scoped_lock lk{in_flight_mutex};
+        in_flight[requester] = fmt::format("{} cmd {} (waiting for service lock)", service_name,
+                                           ctx.GetCommand());
+    }
+    SCOPE_EXIT {
+        std::scoped_lock lk{in_flight_mutex};
+        in_flight.erase(requester);
+    };
     const auto guard = LockService();
+    {
+        std::scoped_lock lk{in_flight_mutex};
+        in_flight[requester] = fmt::format("{} cmd {}", service_name, ctx.GetCommand());
+    }
     SCOPE_EXIT {
         const auto* cmd_buf = ctx.CommandBuffer();
         u32 result_word = 0;

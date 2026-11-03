@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -44,6 +46,7 @@ public:
     using SparseListener = std::function<void(u64 gpu_address, u64 size, bool create)>;
     /// A block of a sparse region gets memory [cpu_address, +size).
     using BackListener = std::function<void(u64 gpu_address, u64 cpu_address, u64 size)>;
+    using KindListener = std::function<bool(u64 gpu_address, u64 size, u8 kind)>;
 
     static Nx2GpuMemoryRegistry& Get() {
         static Nx2GpuMemoryRegistry registry;
@@ -52,6 +55,14 @@ public:
 
     void Register(u64 address, u64 size) {
         MapAt(address, address, size);
+    }
+
+    void MapAt(u32 handle, u64 offset, u64 gpu_address, u64 cpu_address, u64 size) {
+        {
+            std::scoped_lock lk{handle_mutex};
+            handle_mappings[handle].push_back({offset, gpu_address, size});
+        }
+        MapAt(gpu_address, cpu_address, size);
     }
 
     void MapAt(u64 gpu_address, u64 cpu_address, u64 size) {
@@ -64,12 +75,24 @@ public:
     }
 
     // NormalUnmapGpuMemory4K, or destroying the memory: the GPU range stops reaching it.
-    void Unmap(u64 gpu_address, u64 size) {
+    u64 Unmap(u64 gpu_address, u64 size) {
+        {
+            std::scoped_lock lk{handle_mutex};
+            const u64 end = gpu_address + size;
+            for (auto& [handle, ranges] : handle_mappings) {
+                std::erase_if(ranges, [gpu_address, end](const HandleRange& r) {
+                    const u64 r_end = r.gpu_address + r.size;
+                    return r_end > gpu_address && r.gpu_address < end;
+                });
+            }
+        }
+
         std::scoped_lock lk{mutex};
-        TrimMappings(gpu_address, size);
+        const u64 unmapped = TrimMappings(gpu_address, size);
         for (auto& [owner, listener] : listeners) {
             listener.unmap(gpu_address, size);
         }
+        return unmapped;
     }
 
     // Backing memory [cpu_address, +size) is about to be freed (its GPU mappings are gone): each
@@ -122,7 +145,7 @@ public:
 
     void AddListener(const void* owner, Listener listener, UnmapListener unmap_listener,
                      ReleaseListener release_listener = {}, SparseListener sparse_listener = {},
-                     BackListener back_listener = {}) {
+                     BackListener back_listener = {}, KindListener kind_listener = {}) {
         std::scoped_lock lk{mutex};
         for (const auto& m : mappings) {
             listener(m.gpu_address, m.cpu_address, m.size);
@@ -135,7 +158,40 @@ public:
         listeners.insert_or_assign(owner, Listeners{std::move(listener), std::move(unmap_listener),
                                                     std::move(release_listener),
                                                     std::move(sparse_listener),
-                                                    std::move(back_listener)});
+                                                    std::move(back_listener),
+                                                    std::move(kind_listener)});
+    }
+
+    bool ModifyKind(u64 address, u64 size, u8 kind) {
+        if (size == 0 || address + size < address || ((address | size) & 0xFFF) != 0 ||
+            (kind != 0 && kind != 1 && kind != 3 && kind != 6 && kind != 8)) {
+            return false;
+        }
+        std::scoped_lock lk{mutex};
+        const bool mapped = std::any_of(mappings.begin(), mappings.end(), [&](const auto& mapping) {
+            return address >= mapping.gpu_address && address - mapping.gpu_address <= mapping.size &&
+                   size <= mapping.size - (address - mapping.gpu_address);
+        });
+        if (!mapped || listeners.empty()) {
+            return false;
+        }
+        for (const auto& [owner, listener] : listeners) {
+            if (!listener.kind || !listener.kind(address, size, kind)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool ContainsMappingRange(u64 base, u64 offset, u64 size) {
+        std::scoped_lock lk{mutex};
+        for (const auto& mapping : mappings) {
+            if (mapping.gpu_address == base && offset <= mapping.size &&
+                size <= mapping.size - offset) {
+                return true;
+            }
+        }
+        return false;
     }
 
     void RemoveListener(const void* owner) {
@@ -150,6 +206,10 @@ public:
             std::scoped_lock lk{device_mutex};
             device_ranges.clear();
         }
+        {
+            std::scoped_lock lk{handle_mutex};
+            handle_mappings.clear();
+        }
         std::scoped_lock lk{mutex};
         mappings.clear();
         sparse_regions.clear();
@@ -159,6 +219,23 @@ public:
     void RecordDeviceRange(u64 cpu_address, u64 size, u64 device_address) {
         std::scoped_lock lk{device_mutex};
         device_ranges[cpu_address] = {size, device_address};
+    }
+
+    // Device address for a CPU range already backed by an address space mapping, if any. Used to
+    // keep one identity per backing across the process's several GPU address spaces.
+    std::optional<u64> DeviceAddressOfRange(u64 cpu_address, u64 size) {
+        std::scoped_lock lk{device_mutex};
+        auto it = device_ranges.upper_bound(cpu_address);
+        if (it == device_ranges.begin()) {
+            return std::nullopt;
+        }
+        --it;
+        const auto& [start, range] = *it;
+        const u64 offset = cpu_address - start;
+        if (offset > range.first || size > range.first - offset) {
+            return std::nullopt;
+        }
+        return range.second + offset;
     }
 
     std::optional<u64> DeviceAddressOf(u64 cpu_address) {
@@ -175,10 +252,32 @@ public:
         return range.second + (cpu_address - start);
     }
 
+    std::optional<u64> GpuAddressOf(u32 handle, u64 offset) {
+        std::scoped_lock lk{handle_mutex};
+        const auto it = handle_mappings.find(handle);
+        if (it == handle_mappings.end()) {
+            return std::nullopt;
+        }
+        for (auto rit = it->second.rbegin(); rit != it->second.rend(); ++rit) {
+            if (offset >= rit->offset && offset < rit->offset + rit->size) {
+                return rit->gpu_address + (offset - rit->offset);
+            }
+        }
+        return std::nullopt;
+    }
+
 private:
     // Separate lock: ranges are recorded from listeners that run under `mutex`.
     std::mutex device_mutex;
     std::map<u64, std::pair<u64, u64>> device_ranges; // cpu start -> (size, device address)
+
+    struct HandleRange {
+        u64 offset;
+        u64 gpu_address;
+        u64 size;
+    };
+    std::mutex handle_mutex;
+    std::map<u32, std::vector<HandleRange>> handle_mappings;
 
     struct Mapping {
         u64 gpu_address;
@@ -192,11 +291,13 @@ private:
         ReleaseListener release;
         SparseListener sparse;
         BackListener back;
+        KindListener kind;
     };
 
     // Drops [gpu_address, +size) from the recorded mappings, keeping the parts outside it.
-    void TrimMappings(u64 gpu_address, u64 size) {
+    u64 TrimMappings(u64 gpu_address, u64 size) {
         const u64 end = gpu_address + size;
+        u64 unmapped{};
         std::vector<Mapping> kept;
         kept.reserve(mappings.size() + 1);
         for (const auto& m : mappings) {
@@ -205,6 +306,7 @@ private:
                 kept.push_back(m);
                 continue;
             }
+            unmapped += std::min(m_end, end) - std::max(m.gpu_address, gpu_address);
             if (m.gpu_address < gpu_address) {
                 kept.push_back({m.gpu_address, m.cpu_address, gpu_address - m.gpu_address});
             }
@@ -213,6 +315,7 @@ private:
             }
         }
         mappings = std::move(kept);
+        return unmapped;
     }
 
     std::mutex mutex;
@@ -255,10 +358,31 @@ private:
         std::fill(output.begin(), output.end(), u8{0});
         std::copy_n(input.begin(), std::min(input.size(), output.size()), output.begin());
         std::fill(inline_output.begin(), inline_output.end(), u8{0});
+        if (name == "/dev/nvhost-tsg-gpu") {
+            // nvgpu TSG: subcontext create hands out a veid; bind/unbind/delete succeed; the SDK
+            // probes the rest and must see them unsupported.
+            if (command.raw == 0xc0105409 && output.size() >= 12) {
+                const u32 veid = static_cast<u32>(std::countr_one(veid_mask));
+                veid_mask |= u64{1} << (veid & 63);
+                std::memcpy(output.data() + 8, &veid, sizeof(veid));
+                return NvResult::Success;
+            }
+            if (command.raw == 0xc004540a && input.size() >= 4) {
+                u32 veid{};
+                std::memcpy(&veid, input.data(), sizeof(veid));
+                veid_mask &= ~(u64{1} << (veid & 63));
+                return NvResult::Success;
+            }
+            if (command.raw != 0xc0045401 && command.raw != 0xc0045402 &&
+                command.raw != 0xc018540b) {
+                return NvResult::NotImplemented;
+            }
+        }
         return NvResult::Success;
     }
 
     std::string name;
+    u64 veid_mask{};
 };
 
 } // namespace Service::Nvidia::Devices

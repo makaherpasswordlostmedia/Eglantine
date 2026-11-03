@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -336,6 +337,12 @@ void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
 }
 
 void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
+    // The instances after the first are drawn together once their loop ends, and they must see
+    // the state they were begun with: NVN's draw macros reset the base instance (and its copy in
+    // c[0][0x644]) right after the loop, before the macro returns.
+    if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) [[unlikely]] {
+        draw_manager.DrawDeferred(*this);
+    }
     regs.reg_array[method] = argument;
     for (auto const& table : dirty.tables)
         dirty.flags[table[method]] = true;
@@ -516,6 +523,10 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
         ProcessMacro(system, method, base_start, amount, amount == methods_pending);
         return;
     }
+    // As in ProcessDirtyRegisters: the paths below write without it.
+    if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) [[unlikely]] {
+        draw_manager.DrawDeferred(*this);
+    }
     switch (method) {
     case MAXWELL3D_REG_INDEX(const_buffer.buffer):
     case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 1:
@@ -561,7 +572,18 @@ void Maxwell3D::ProcessMacroUpload(u32 data) {
 }
 
 void Maxwell3D::ProcessMacroBind(u32 data) {
-    GetNativeMacroPositions()[regs.load_mme.start_address_ptr++] = data;
+    const auto positions = GetNativeMacroPositions();
+    const u32 index = regs.load_mme.start_address_ptr++;
+    if (index >= positions.size()) {
+        static std::atomic<u32> rejected{};
+        if (rejected.fetch_add(1) < 8) {
+            LOG_ERROR(HW_GPU,
+                      "Rejecting out-of-range macro bind: index={:#x}, entries={}, data={:#x}",
+                      index, positions.size(), data);
+        }
+        return;
+    }
+    positions[index] = data;
 }
 
 void Maxwell3D::ProcessFirmwareCall4() {
@@ -846,12 +868,13 @@ bool FrontHandledOutsideDrawManager(u32 method) {
 }
 
 // EDEN_NX2_SPLIT_SKIP=0: send state writes that keep the register's value too.
+const bool g_front_skip_same = [] {
+    const char* value = std::getenv("EDEN_NX2_SPLIT_SKIP");
+    return value == nullptr || value[0] != '0';
+}();
+
 bool FrontSkipSame() {
-    static const bool skip = [] {
-        const char* value = std::getenv("EDEN_NX2_SPLIT_SKIP");
-        return value == nullptr || value[0] != '0';
-    }();
-    return skip;
+    return g_front_skip_same;
 }
 
 } // Anonymous namespace
@@ -1109,7 +1132,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                              u32 count) {
     // The words may be written by methods still queued for the back (indirect draw arguments
     // from a culling dispatch), and the caches that may hold newer ones belong to it.
-    split.Drain();
+    split.Drain(VideoCommon::Nx2Profile::Zone::DrainDmaRead);
     const GPUVAddr source = (GPUVAddr{fs.regs[0x154] & 0x1ffffff} << 32) | fs.regs[0x155];
     const u32 ram = fs.regs[0x156];
     const u32 words = std::min<u32>(count, 0x1000);

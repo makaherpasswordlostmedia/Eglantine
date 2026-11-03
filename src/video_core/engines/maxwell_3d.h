@@ -3083,6 +3083,12 @@ public:
         void ProcessMethodCall(Maxwell3D& maxwell3d, u32 method, u32 argument);
         void Clear(Maxwell3D& maxwell3d, u32 layer_count);
         void DrawDeferred(Maxwell3D& maxwell3d);
+        /// Instances after the first wait to be drawn together (DrawDeferred).
+        [[nodiscard]] bool HasDeferredDraw() const noexcept {
+            return draw_state.draw_mode == DrawMode::Instance && draw_state.instance_count != 0;
+        }
+        /// Methods an instance loop writes between its draws; any other write ends the loop.
+        [[nodiscard]] static bool IsInstanceLoopMethod(u32 method) noexcept;
         void DrawArray(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, u32 base_instance, u32 num_instances);
         void DrawArrayInstanced(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, bool subsequent);
         void DrawIndex(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 index_first, u32 index_count, u32 base_index, u32 base_instance, u32 num_instances);
@@ -3264,12 +3270,13 @@ private:
     void CallMacroMethod(Core::System& system, u32 method, std::span<const u32> parameters);
 
     /// Whether state register writes that keep the register's value are dropped (CallMethod).
+    /// Read at startup: this runs for every register write (no function-local static guard).
+    static inline const bool skip_same_value_writes = [] {
+        const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
+        return value == nullptr || value[0] != '0';
+    }();
     static bool SkipSameValueWrites() {
-        static const bool skip = [] {
-            const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
-            return value == nullptr || value[0] != '0';
-        }();
-        return skip;
+        return skip_same_value_writes;
     }
 
     /// Handles writes to the macro uploading register.

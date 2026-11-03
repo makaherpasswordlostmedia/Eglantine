@@ -241,6 +241,13 @@ add_executable(yuzu
 
 set_target_properties(yuzu PROPERTIES OUTPUT_NAME "eglantine")
 
+# Shipped next to the executable: the NX2 switches a GUI launch cannot set another way. Read at
+# startup (LoadNx2Switches in main.cpp); a user copy in %APPDATA%\eden overrides it.
+add_custom_command(TARGET yuzu PRE_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${PROJECT_SOURCE_DIR}/dist/nx2_switches.txt" "$<TARGET_FILE_DIR:yuzu>/nx2_switches.txt"
+    VERBATIM)
+
 if (YUZU_CRASH_DUMPS)
     target_sources(yuzu PRIVATE
         breakpad.cpp
@@ -373,7 +380,7 @@ if (APPLE)
             XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED ON)
     # Otherwise, we'll use our own.
     else()
-        set(_icons "${_dist}/eglantine.icns" "${_dist}/Assets.car")
+        set(_icons "${_dist}/eden.icns" "${_dist}/Assets.car")
     endif()
 
     set_source_files_properties(${_icons} PROPERTIES

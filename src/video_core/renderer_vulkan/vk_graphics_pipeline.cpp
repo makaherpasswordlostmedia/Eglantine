@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <optional>
 #include <span>
+#include <set>
 
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
@@ -18,6 +20,7 @@
 #include "common/bit_field.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
+#include "video_core/renderer_vulkan/pipeline_stats.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
@@ -257,12 +260,12 @@ GraphicsPipeline::GraphicsPipeline(
     GuestDescriptorQueue& guest_descriptor_queue_, DescriptorBufferRing& descriptor_buffer_ring_,
     Common::ThreadWorker* worker_thread,
     PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
-    const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
+    const GraphicsPipelineCacheKey& key_, std::shared_ptr<const GraphicsShaderModules> modules,
     const std::array<const Shader::Info*, NUM_STAGES>& infos)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
       pipeline_cache(pipeline_cache_), scheduler{scheduler_},
       guest_descriptor_queue{guest_descriptor_queue_},
-      descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)} {
+      descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(modules)} {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -312,13 +315,24 @@ GraphicsPipeline::GraphicsPipeline(
         }
     }
 
-    auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics] {
+    // Before the build may run: it releases the modules.
+    configure_func = ConfigureFunc(*spv_modules, stage_infos);
+
+    const bool on_parallel_worker{worker_thread != nullptr};
+    auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics, on_parallel_worker] {
+        std::optional<PipelineStats::ScopedRole> stats_role;
+        if (on_parallel_worker) {
+            stats_role.emplace(PipelineStats::Role::Par);
+        }
         const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
         Validate();
         try {
+            const PipelineStats::ScopedTimer stats_timer{PipelineStats::Kind::Graphics,
+                                                         PipelineStats::Stage::Driver};
             MakePipeline(render_pass);
         } catch (const vk::Exception& exception) {
             LOG_CRITICAL(Render_Vulkan, "Graphics pipeline build failed: {}", exception.what());
+            spv_modules = {};
             std::scoped_lock lock{build_mutex};
             is_built = true;
             build_condvar.notify_one();
@@ -327,6 +341,9 @@ GraphicsPipeline::GraphicsPipeline(
             }
             return;
         }
+        // The modules are only needed to create the pipeline. Kept, the driver holds every
+        // pipeline's SPIR-V for the whole session (thousands of pipelines from the disk cache).
+        spv_modules = {};
         if (pipeline_statistics) {
             pipeline_statistics->Collect(device, *pipeline);
         }
@@ -343,7 +360,6 @@ GraphicsPipeline::GraphicsPipeline(
     } else {
         func();
     }
-    configure_func = ConfigureFunc(spv_modules, stage_infos);
 }
 
 void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
@@ -463,6 +479,35 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         Profile::Scope scope{Profile::Zone::FillImageViews};
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                      Spec::has_images);
+    }
+    static const bool scanout_diagnostics = std::getenv("EDEN_NX2_SCANOUT_DIAG") != nullptr;
+    if (scanout_diagnostics && maxwell3d->GetNativeMacroEngine().native_turing) {
+        static std::set<std::pair<u64, u64>> reported;
+        const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) |
+                       regs.pipelines[5].reserved[1];
+        if (reported.size() < 64 && reported.emplace(ps, regs.rt[0].Address()).second) {
+            LOG_INFO(HW_GPU, "Native draw inputs: ps={:#x} rt={:#x} {}x{} textures={}",
+                     ps, regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height, views.size());
+            for (const auto& entry : views) {
+                const auto& view = texture_cache.GetImageView(entry.id);
+                LOG_INFO(HW_GPU, "  texture index={} address={:#x} {}x{} format={}",
+                         entry.index, view.GpuAddr(), view.size.width, view.size.height, view.format);
+            }
+            const auto describe_buffer = [&](u32 stage, u32 bank, u32 offset, u32 words) {
+                const auto& buffer = maxwell3d->state.shader_stages[stage].const_buffers[bank];
+                std::array<u32, 16> values{};
+                if (buffer.enabled && buffer.size >= offset + words * sizeof(u32) &&
+                    gpu_memory->IsFullyMappedRange(buffer.address + offset, words * sizeof(u32))) {
+                    gpu_memory->ReadBlockUnsafe(buffer.address + offset, values.data(), words * sizeof(u32));
+                }
+                LOG_INFO(HW_GPU, "  stage={} c[{}] address={:#x} enabled={} size={:#x} offset={:#x}: {:08x}",
+                         stage, bank, buffer.address, buffer.enabled, buffer.size, offset,
+                         fmt::join(std::span(values.data(), words), " "));
+            };
+            describe_buffer(0, 6, 0x70, 16);
+            describe_buffer(4, 11, 0x320, 4);
+            describe_buffer(4, 7, 0x20c, 1);
+        }
     }
 
     VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};
@@ -778,7 +823,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     if (!vertex_binding_divisors.empty()) {
         vertex_input_ci.pNext = &input_divisor_ci;
     }
-    const bool has_tess_stages = spv_modules[1] || spv_modules[2];
+    const bool has_tess_stages = (*spv_modules)[1] || (*spv_modules)[2];
     auto input_assembly_topology = MaxwellToVK::PrimitiveTopology(device, key.state.topology);
     if (input_assembly_topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST) {
         if (!has_tess_stages) {
@@ -1087,7 +1132,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     };
     static_vector<VkPipelineShaderStageCreateInfo, 5> shader_stages;
     for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
-        if (!spv_modules[stage]) {
+        if (!(*spv_modules)[stage]) {
             continue;
         }
         [[maybe_unused]] auto& stage_ci =
@@ -1096,7 +1141,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
                 .pNext = nullptr,
                 .flags = 0,
                 .stage = MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage)),
-                .module = *spv_modules[stage],
+                .module = *(*spv_modules)[stage],
                 .pName = "main",
                 .pSpecializationInfo = nullptr,
             });

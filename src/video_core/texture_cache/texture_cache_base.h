@@ -141,10 +141,14 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     std::vector<u8> astc_scan_buffer;
     u64 images_deleted{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
+    bool debug_stats{true}; ///< Collect what only the debug statistics lines use
 
     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
     static constexpr size_t GC_EMERGENCY_COUNTS = 2;
+    /// Switch 2 titles: images unused this long (frames) are dropped before memory gets tight.
+    static constexpr u64 STALE_IMAGE_FRAMES = 3 * 60 * 60;
+    static constexpr size_t STALE_DELETES_PER_FRAME = 8;
 
     using Runtime = typename P::Runtime;
     using Image = typename P::Image;
@@ -426,6 +430,23 @@ private:
 
     /// Stop tracking CPU reads and writes for image
     void UntrackImage(ImageBase& image, ImageId image_id);
+
+    /// Records a CPU write into a large 2D image page by page instead of untracking it whole.
+    /// Returns false when the image does not qualify (the caller marks it modified as usual).
+    bool MarkPartialWrite(ImageBase& image, DAddr cpu_addr, size_t size);
+
+    /// Uploads a large plain 2D image in chunks; false if it does not qualify.
+    bool UploadInChunks(Image& image);
+
+    /// Records a GPU remap of a small part of a large 2D image for a partial re-upload instead of
+    /// marking the whole image remapped (which replaces it). False if the image does not qualify.
+    bool MarkPartialRemap(ImageBase& image, GPUVAddr gpu_addr, size_t size);
+
+    /// Tracks the pages of a partial write again and forgets them.
+    void RestorePartialPages(ImageBase& image);
+
+    /// Uploads the block rows the recorded pages cover. Returns false if the layout is not handled.
+    bool RefreshPartialContents(Image& image);
 
     /// Delete image from the cache
     void DeleteImage(ImageId image, bool immediate_delete = false);

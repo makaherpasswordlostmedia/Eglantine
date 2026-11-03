@@ -109,7 +109,35 @@ bool DmaPusher::Step() {
             if (kepler_payload || macro_payload) {
                 const size_t words = std::min<size_t>(dma_state.method_count, header.size);
                 auto* const engine_state = subchannels[dma_state.subchannel];
-                if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+                // Parameters continued in an entry of their own can be arguments the GPU wrote
+                // (Donkey Kong Bananza's terrain: the culling pass counts each mesh's triangles
+                // into a 5-word indirect draw record and the colour pass draws with it). Read
+                // without a flush, the macro sees the older guest words (a zero count, so the
+                // terrain is never drawn). EDEN_NX2_PBFLUSH=0 turns this off.
+                static const bool flush_parameters = [] {
+                    const char* value = std::getenv("EDEN_NX2_PBFLUSH");
+                    return value == nullptr || value[0] != '0';
+                }();
+                bool flushed_parameters = false;
+                if (flush_parameters && words <= 64) {
+                    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+                        split.Drain(VideoCommon::Nx2Profile::Zone::DrainPbFlush);
+                    }
+                    const GPUVAddr address = dma_state.dma_get;
+                    const size_t bytes = words * sizeof(u32);
+                    if (memory_manager.IsMemoryDirty(address, bytes, VideoCommon::CacheType::BufferCache)) {
+                        memory_manager.FlushRegion(address, bytes, VideoCommon::CacheType::BufferCache);
+                        flushed_parameters = true;
+                        static std::atomic<u32> flush_logs{};
+                        if (flush_logs.fetch_add(1) < 20) {
+                            LOG_INFO(HW_GPU, "Macro parameters at {:#x} ({} words) were written by the GPU: flushed",
+                                     address, words);
+                        }
+                    }
+                }
+                if (flushed_parameters) {
+                    engine_state->current_dirty = false;
+                } else if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
                     // The caches behind IsMemoryDirty belong to the split's back thread.
                     split.Defer([engine_state, memory = &memory_manager, address = GPUVAddr{dma_state.dma_get},
                                  bytes = words * sizeof(u32)] {
@@ -155,13 +183,43 @@ bool DmaPusher::Step() {
         // (the split only starts with unsafe reads; the settings can change mid-game).
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
-        if (use_safe) {
+        // The words as submitted, unless this is a resumed entry or the GPU has newer ones the
+        // safe read below would flush (with the split, the front can't tell: it reads memory
+        // unflushed anyway).
+        // Command lists the GPU fills itself (culling dispatches) only have their words in memory.
+        const auto gpu_written = [&] {
+            if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+                return false;
+            }
+            const GPUVAddr end = dma_state.dma_get + size_t{header.size} * sizeof(u32);
+            for (GPUVAddr page = dma_state.dma_get & ~GPUVAddr{0xfff}; page < end; page += 0x1000) {
+                if (const auto device = memory_manager.GpuToCpuAddress(page);
+                    device && Tegra::Nx2IsGpuWritten(*device)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        const bool submitted = command_resume_offset == 0 &&
+                               dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
+                               !(use_safe && memory_manager.IsMemoryDirty(dma_state.dma_get,
+                                                                          header.size * sizeof(u32))) &&
+                               !gpu_written();
+        if (submitted) {
+            const std::span<const CommandHeader> commands{
+                command_list.submitted_words.data() +
+                    command_list.submitted_offsets[dma_pushbuffer_subindex],
+                header.size};
+            RecordParsedEntry(header, commands);
+            command_resume_offset += ProcessCommands(commands, 0);
+        } else if (use_safe) {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else {
+            FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
@@ -198,7 +256,7 @@ bool DmaPusher::Step() {
     }
 
     if (signal_sync) {
-        VideoCommon::GpuSplit::Get().Drain();
+        VideoCommon::GpuSplit::Get().Drain(VideoCommon::Nx2Profile::Zone::DrainSync);
         rasterizer->SignalFence([this]() {
             std::scoped_lock lk(sync_mutex);
             synced = true;
@@ -211,6 +269,16 @@ bool DmaPusher::Step() {
 
 size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset) {
     for (size_t index = 0; index < commands.size();) {
+        // Discard the rest of a command block that was rejected (illegal method). The block's
+        // declared count still tells where the next header starts, so the stream stays aligned
+        // instead of running thousands of bogus methods.
+        if (dma_state.skip_words != 0) {
+            const u32 skip =
+                static_cast<u32>(std::min<std::size_t>(dma_state.skip_words, commands.size() - index));
+            index += skip;
+            dma_state.skip_words -= skip;
+            continue;
+        }
         // Data word of methods command
         if (dma_state.method_count && dma_state.non_incrementing) {
             auto const& command_header = commands[index]; //must ref (MUltiMethod re)
@@ -347,6 +415,23 @@ bool DmaPusher::WantsSegment() const {
 }
 
 void DmaPusher::CallMethod(u32 argument) {
+    // Method 0x1 is illegal in the host class: a stream that reaches it has been misparsed (for
+    // example, a split method continued into a different command buffer). Discard the rest of
+    // the block using its declared count instead of running thousands of bogus methods against
+    // the engines; the next header then parses from an aligned position.
+    if (dma_state.method == static_cast<u32>(BufferMethods::Illegal)) {
+        const u32 remaining = dma_state.method_count > 0 ? dma_state.method_count - 1 : 0;
+        static std::atomic<u32> reported{};
+        if (reported.fetch_add(1) < 8) {
+            LOG_ERROR(HW_GPU,
+                      "Illegal host method on subchannel {}: discarding {} words of the block",
+                      dma_state.subchannel, remaining);
+        }
+        dma_state.skip_words = remaining;
+        dma_state.method_count = remaining != 0 ? 1 : 0;
+        dma_state.non_incrementing = false;
+        return;
+    }
     if (g_semaphore_watch != 0) [[unlikely]] {
         WatchArgument(dma_state.method, argument);
     }
@@ -442,6 +527,32 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
         subchannel->ConsumeSink(system);
         subchannel->current_dma_segment = dma_state.dma_get + dma_state.dma_word_offset;
         subchannel->CallMultiMethod(system, dma_state.method, base_start, num_methods, dma_state.method_count);
+    }
+}
+
+void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
+    // Title 1 runs small command lists its culling dispatches fill in each frame. Accurate GPU
+    // mode reads every command list through the caches (safe reads); here only the ones on pages
+    // the GPU has written are, or their draws run with an older frame's words (trees vanish).
+    if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) || size == 0) {
+        return;
+    }
+    bool written = false;
+    for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < address + size; page += 0x1000) {
+        if (const auto device = memory_manager.GpuToCpuAddress(page);
+            device && Tegra::Nx2IsGpuWritten(*device)) {
+            written = true;
+            break;
+        }
+    }
+    if (!written) {
+        return;
+    }
+    // The caches belong to the split's back: it first runs what the front queued (the dispatch
+    // that writes these words among it).
+    VideoCommon::GpuSplit::Get().Drain(VideoCommon::Nx2Profile::Zone::DrainWritten);
+    if (memory_manager.IsMemoryDirty(address, size, VideoCommon::CacheType::BufferCache)) {
+        memory_manager.FlushRegion(address, size, VideoCommon::CacheType::BufferCache);
     }
 }
 

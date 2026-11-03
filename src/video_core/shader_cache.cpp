@@ -14,6 +14,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/assert.h"
+#include "video_core/native_clip.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/object_pool.h"
@@ -49,9 +50,26 @@ ShaderCache::ShaderCache(Tegra::MaxwellDeviceMemoryManager& device_memory_)
     : device_memory{device_memory_} {}
 
 bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
+    const auto clip_compatible = [&] {
+        const bool needs_clip = std::any_of(shader_infos.begin(), shader_infos.end(),
+            [](const ShaderInfo* info) { return info && info->requires_rasterizer_clip; });
+        if (!needs_clip) return true;
+        const bool compatible = RasterizerFrustumClipCompatible(maxwell3d->regs);
+        if (!compatible) {
+            static bool reported{};
+            if (!reported) {
+                reported = true;
+                LOG_WARNING(HW_GPU, "Deferred clip export rejected by pipeline: geometry_clip={}, gs={}, tf={}",
+                    maxwell3d->regs.viewport_clip_control.geometry_clip.Value(),
+                    maxwell3d->regs.IsShaderConfigEnabled(Tegra::Engines::Maxwell3D::Regs::ShaderType::Geometry),
+                    maxwell3d->regs.transform_feedback_enabled);
+            }
+        }
+        return compatible;
+    };
     auto& dirty{maxwell3d->dirty.flags};
     if (!dirty[VideoCommon::Dirty::Shaders]) {
-        return last_shaders_valid;
+        return last_shaders_valid && clip_compatible();
     }
     dirty[VideoCommon::Dirty::Shaders] = false;
 
@@ -60,6 +78,7 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
     for (size_t index = 0; index < Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram; ++index) {
         if (!maxwell3d->regs.IsShaderConfigEnabled(index)) {
             unique_hashes[index] = 0;
+            shader_infos[index] = nullptr;
             continue;
         }
         const auto& shader_config{maxwell3d->regs.pipelines[index]};
@@ -67,6 +86,7 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
         if (program == Tegra::Engines::Maxwell3D::Regs::ShaderType::Pixel &&
             !maxwell3d->regs.rasterize_enable) {
             unique_hashes[index] = 0;
+            shader_infos[index] = nullptr;
             continue;
         }
         const GPUVAddr shader_addr{native
@@ -89,7 +109,8 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
         if (!shader_info) {
             const u32 start_address{native ? 0 : shader_config.offset};
             try {
-                // Native programs are lowered while the environment is built.
+                // Native programs are lowered while the environment is built (once: the
+                // ShaderInfo keeps the result for the pipeline's environments).
                 RethrowIfRejected(*cpu_shader_addr);
                 GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, native ? shader_addr : base_addr, start_address};
                 shader_info = MakeShaderInfo(env, *cpu_shader_addr);
@@ -113,7 +134,7 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
         unique_hashes[index] = shader_info->unique_hash;
     }
     last_shaders_valid = true;
-    return true;
+    return clip_compatible();
 } catch (const Shader::Exception& error) {
     auto& native = maxwell3d->GetNativeMacroEngine();
     if (!native.native_turing) throw;
@@ -202,7 +223,8 @@ void ShaderCache::GetGraphicsEnvironments(GraphicsEnvironments& result,
         const GPUVAddr address = native
             ? (static_cast<u64>(config.reserved[0] & 0xff) << 32) | config.reserved[1]
             : base_addr;
-        env = GraphicsEnvironment{*maxwell3d, *gpu_memory, program, address, start_address};
+        env = GraphicsEnvironment{*maxwell3d, *gpu_memory, program, address, start_address,
+                                  shader_infos[index]->lowered_native};
         env.SetCachedSize(shader_infos[index]->size_bytes);
         result.env_ptrs[env_index++] = &env;
     }
@@ -331,6 +353,7 @@ ShaderCache::Entry* ShaderCache::NewEntry(VAddr addr, VAddr addr_end, ShaderInfo
 
 const ShaderInfo* ShaderCache::MakeShaderInfo(GenericEnvironment& env, VAddr cpu_addr) {
     auto info = std::make_unique<ShaderInfo>();
+    info->requires_rasterizer_clip = env.RequiresRasterizerClip();
     if (const std::optional<u64> cached_hash{env.Analyze()}) {
         info->unique_hash = *cached_hash;
         info->size_bytes = env.CachedSizeBytes();
@@ -342,6 +365,7 @@ const ShaderInfo* ShaderCache::MakeShaderInfo(GenericEnvironment& env, VAddr cpu
         info->unique_hash = env.CalculateHash();
         info->size_bytes = env.ReadSizeBytes();
     }
+    info->lowered_native = env.LoweredNative();
     const size_t size_bytes{env.SourceSizeBytes() ? env.SourceSizeBytes() : info->size_bytes};
     const ShaderInfo* const result{info.get()};
     Register(std::move(info), cpu_addr, size_bytes);

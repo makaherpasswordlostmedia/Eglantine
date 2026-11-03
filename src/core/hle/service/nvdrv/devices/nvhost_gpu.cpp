@@ -5,7 +5,11 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
+#include <mutex>
 #include <cstring>
 #include <vector>
 #include "common/assert.h"
@@ -24,6 +28,7 @@
 #include "video_core/engines/puller.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/memory_manager.h"
 
 namespace Service::Nvidia::Devices {
 namespace {
@@ -180,6 +185,14 @@ NvResult nvhost_gpu::ZCullBind(IoctlZCullBind& params) {
 NvResult nvhost_gpu::SetErrorNotifier(IoctlSetErrorNotifier& params) {
     LOG_WARNING(Service_NVDRV, "(STUBBED) called, offset={:X}, size={:X}, mem={:X}", params.offset,
                 params.size, params.mem);
+    // Like the host driver, clear the notifier when it is installed: NVN polls its status word and
+    // treats a non-zero value (whatever the buffer held before) as a channel error.
+    if (const auto handle = nvmap.GetHandle(params.mem);
+        handle && handle->address && params.size && params.size <= 0x10000 &&
+        params.offset + params.size <= handle->size) {
+        const std::vector<u8> zeros(params.size);
+        system.ApplicationMemory().WriteBlock(handle->address + params.offset, zeros.data(), zeros.size());
+    }
     return NvResult::Success;
 }
 
@@ -411,7 +424,7 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
 
     auto& gpu = system.GPU();
 
-    std::scoped_lock lock(channel_mutex);
+    std::unique_lock lock(channel_mutex);
 
     // Lazily initialize channel when address space is available
     if (!channel_state->initialized && channel_state->memory_manager) {
@@ -433,6 +446,30 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
                 system.ApplicationMemory().ReadBlock(entry.addr.Value(), words.data(),
                                                      words.size() * sizeof(u32));
                 entries.submit_hashes.push_back(Tegra::HashPushbufferWords(words));
+            }
+        }
+        // The present returns before the GPU thread reaches this frame's work (nx2_gsv.h,
+        // frames ahead), and Mario Kart World then refills command memory it already
+        // submitted: the end of a frame ran with the next frame's present image as its render
+        // target, leaving an image three frames old to be shown. Keep the words as submitted.
+        // EDEN_NX2_PB_SNAPSHOT=0: execute from memory.
+        static const bool snapshot = [] {
+            const char* value = std::getenv("EDEN_NX2_PB_SNAPSHOT");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (snapshot && channel_state->memory_manager) {
+            size_t words = 0;
+            for (const auto& entry : entries.command_lists) {
+                words += entry.size;
+            }
+            entries.submitted_words.resize(words);
+            entries.submitted_offsets.reserve(entries.command_lists.size());
+            size_t offset = 0;
+            for (const auto& entry : entries.command_lists) {
+                entries.submitted_offsets.push_back(static_cast<u32>(offset));
+                channel_state->memory_manager->ReadBlockUnsafe(
+                    entry.addr, entries.submitted_words.data() + offset, entry.size * sizeof(u32));
+                offset += entry.size;
             }
         }
     }
@@ -478,6 +515,54 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
                  system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(params.fence.id));
     }
     flags.raw = 0;
+
+    if (g_nx2_driver) {
+        // Wait until the GPU has run this submission. The Yoshi demo rewrites command memory it
+        // submitted once it believes the GPU is past it; with the GPU thread behind, the pushbuffer
+        // was read half-rewritten and the command stream derailed. EDEN_NX2_SYNC_SUBMIT enables
+        // this for any title.
+        static const bool sync_submit = std::getenv("EDEN_NX2_SYNC_SUBMIT") != nullptr ||
+                                        system.GetApplicationProcessProgramID() == 0x04007C6028AA8000ULL;
+        if (sync_submit && increment > 0) {
+            lock.unlock();
+            auto& syncpoints = system.Host1x().GetSyncpointManager();
+            if (!syncpoints.IsReadyGuest(params.fence.id, params.fence.value)) {
+                struct Wake {
+                    std::mutex mutex;
+                    std::condition_variable cv;
+                    bool done{};
+                };
+                auto wake = std::make_shared<Wake>();
+                syncpoints.RegisterGuestAction(params.fence.id, params.fence.value, [wake] {
+                    {
+                        std::scoped_lock lk{wake->mutex};
+                        wake->done = true;
+                    }
+                    wake->cv.notify_all();
+                });
+                const auto deadline =
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds{2000};
+                std::unique_lock lk{wake->mutex};
+                while (!wake->done && system.IsPoweredOn()) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now >= deadline) {
+                        break;
+                    }
+                    wake->cv.wait_for(
+                        lk, std::min(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now),
+                                     std::chrono::milliseconds{50}));
+                }
+            }
+            static std::atomic<u32> timeouts{};
+            if (!syncpoints.IsReadyGuest(params.fence.id, params.fence.value) &&
+                (timeouts.fetch_add(1, std::memory_order_relaxed) % 64) == 0) {
+                LOG_WARNING(Service_NVDRV,
+                            "nx2 sync submit timed out waiting for fence ({}, {}), current value={}",
+                            params.fence.id, params.fence.value,
+                            syncpoints.GetGuestSyncpointValue(params.fence.id));
+            }
+        }
+    }
 
     return NvResult::Success;
 }
