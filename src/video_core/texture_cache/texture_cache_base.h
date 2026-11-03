@@ -167,11 +167,26 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// Records the layers a write of [cpu_addr, +size) touches.
     void MarkLayersWritten(Image& image, DAddr cpu_addr, size_t size);
 
+    /// SparseTiles images: notes a written range, uploaded with the next refresh.
+    void MarkRangeWritten(Image& image, DAddr cpu_addr, size_t size);
+
+    /// SparseTiles images: binds and uploads the parts written since the last upload.
+    void RefreshSparseTiles(Image& image);
+
+    /// Image::BindTiles, counting what it binds in total_used_memory.
+    bool BindSparseTiles(Image& image, std::span<const LevelRect> rects);
+
+    /// Image::BackTilesWhole, counting what it binds in total_used_memory.
+    bool BackSparseTilesWhole(Image& image);
+
     /// Uploads the image's dirty layers. False when it needs a full upload instead.
     bool UploadWrittenLayers(Image& image);
 
     /// Gives the written layers of a SparseLayers image memory and uploads them.
     void RefreshSparseLayers(Image& image);
+
+    /// Image::BindLayers, with the memory it binds counted in total_used_memory.
+    std::vector<u32> BindSparseLayers(Image& image, std::span<const u32> layers);
 
     /// Uploads `layers` of the image from guest memory.
     void UploadLayers(Image& image, std::span<const u32> layers);
@@ -211,6 +226,11 @@ public:
 
     /// Mark an image as modified from the GPU
     void MarkModification(ImageId id) noexcept;
+
+    /// A new command list starts: descriptors have to be read from memory again.
+    void NewDescriptorEpoch() {
+        ++descriptor_memo_serial;
+    }
 
     /// Fill image_view_ids with the graphics/compute images in indices
     void FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist = true);
@@ -467,6 +487,11 @@ private:
     bool ScaleDown(Image& image);
     u64 GetScaledImageSizeBytes(const ImageBase& image);
 
+    /// The device memory an image counts for in total_used_memory between two driver readings:
+    /// none for an unbacked image (too large to back, or over unwritten sparse blocks), what is
+    /// bound to its layers for a SparseLayers one.
+    u64 ImageMemoryBytes(const Image& image) const;
+
     void QueueAsyncDecode(Image& image, ImageId image_id);
     void TickAsyncDecode();
 
@@ -484,6 +509,22 @@ private:
     std::array<ImageId, 8> rt_image_id{};
     ImageId rt_depth_image_id{};
     u64 texture_bindings_serial = 0;
+
+    /// Graphics descriptors already read from memory in this command list. A pool isn't rewritten
+    /// between the draws of a list, unless a write the cache sees lands on it.
+    struct DescriptorMemo {
+        u32 index{~0U};
+        Common::SlotId id{};
+        u64 serial{};
+    };
+    std::array<DescriptorMemo, 256> image_view_memo{};
+    std::array<DescriptorMemo, 256> sampler_memo{};
+    std::array<std::pair<DAddr, DAddr>, 2> descriptor_pool_ranges{};
+    const void* descriptor_memo_channel{};
+    u64 descriptor_memo_serial{1};
+
+    void CheckDescriptorMemoChannel();
+    void UpdateDescriptorPoolRanges();
     u64 last_feedback_loop_serial = 0;
     u64 last_feedback_texture_serial = 0;
     bool last_feedback_loop_result = false;

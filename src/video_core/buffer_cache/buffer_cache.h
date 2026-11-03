@@ -166,6 +166,7 @@ void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size
 
 template <class P>
 void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size) {
+    NoteWrite(device_addr, size);
     if (IsRegionGpuModified(device_addr, size)) {
         ClearDownload(device_addr, size);
         gpu_modified_ranges.Subtract(device_addr, size);
@@ -243,6 +244,9 @@ void BufferCache<P>::ClearDownload(DAddr device_addr, u64 size) {
 
 template <class P>
 bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
+    if (const auto written = gpu_memory->GpuToCpuAddress(dest_address)) {
+        NoteWrite(*written, amount);
+    }
     const std::optional<DAddr> cpu_src_address = gpu_memory->GpuToCpuAddress(src_address);
     const std::optional<DAddr> cpu_dest_address = gpu_memory->GpuToCpuAddress(dest_address);
     if (!cpu_src_address || !cpu_dest_address) {
@@ -279,8 +283,10 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
         const DAddr diff = base_address - *cpu_src_address;
         const DAddr new_base_address = *cpu_dest_address + diff;
         tmp_intervals.push_back({new_base_address, size});
-        if (AsyncBufferDownloads()) {
+        if (DownloadsAtFence(new_base_address, size)) {
             uncommitted_gpu_modified_ranges.Add(new_base_address, size);
+        } else {
+            ArmReadTraps(new_base_address, size);
         }
     };
     gpu_modified_ranges.ForEachInRange(*cpu_src_address, amount, mirror);
@@ -310,6 +316,9 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
 
 template <class P>
 bool BufferCache<P>::DMAClear(GPUVAddr dst_address, u64 amount, u32 value) {
+    if (const auto written = gpu_memory->GpuToCpuAddress(dst_address)) {
+        NoteWrite(*written, amount * sizeof(u32));
+    }
     const std::optional<DAddr> cpu_dst_address = gpu_memory->GpuToCpuAddress(dst_address);
     if (!cpu_dst_address) {
         return false;
@@ -999,6 +1008,20 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     TouchBuffer(buffer, binding.buffer_id);
     const bool has_host_buffer = binding.buffer_id != NULL_BUFFER_ID;
     const u32 offset = has_host_buffer ? buffer.Offset(device_addr) : 0;
+    // EDEN_NX2_UNIFORM_REUSE=0 copies small uniform buffers for every draw, as before.
+    static const bool uniform_reuse = [] {
+        const char* value = std::getenv("EDEN_NX2_UNIFORM_REUSE");
+        return value == nullptr || value[0] != '0';
+    }();
+    if constexpr (!IS_OPENGL) {
+        if (uniform_reuse && has_host_buffer &&
+            runtime.RebindMappedUniformBuffer(stage, index, device_addr, size,
+                                              WriteStamp(device_addr, size))) {
+            channel_state->fast_bound_uniform_buffers[stage] |= 1u << binding_index;
+            channel_state->uniform_buffer_binding_sizes[stage][binding_index] = size;
+            return;
+        }
+    }
     const bool needs_alignment_stream = [&]() {
         if constexpr (IS_OPENGL) {
             return false;
@@ -1036,6 +1059,10 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         // Stream buffer path to avoid stalling on non-Nvidia drivers or Vulkan
         const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
         device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
+        if constexpr (!IS_OPENGL) {
+            runtime.RememberMappedUniformBuffer(stage, index, device_addr, size,
+                                                WriteStamp(device_addr, size));
+        }
         return;
     }
     // Classic cached path
@@ -1595,6 +1622,7 @@ void BufferCache<P>::UpdateComputeTextureBuffers() {
 
 template <class P>
 void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync) {
+    NoteWrite(device_addr, size);
     if constexpr (!IS_OPENGL) {
         if (needs_sync) {
             Buffer& buffer = slot_buffers[buffer_id];
@@ -1603,8 +1631,10 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     }
     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
     gpu_modified_ranges.Add(device_addr, size);
-    if (AsyncBufferDownloads()) {
+    if (DownloadsAtFence(device_addr, size)) {
         uncommitted_gpu_modified_ranges.Add(device_addr, size);
+    } else {
+        ArmReadTraps(device_addr, size);
     }
 }
 
@@ -1756,6 +1786,7 @@ BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size,
     wanted_size = static_cast<u32>(device_addr_end - device_addr);
     const OverlapResult overlap = ResolveOverlaps(device_addr, wanted_size);
     const u32 size = static_cast<u32>(overlap.end - overlap.begin);
+    NoteWrite(overlap.begin, size);
     const BufferId new_buffer_id =
         slot_buffers.insert(runtime, overlap.begin, size, sparse_compatible);
     auto& new_buffer = slot_buffers[new_buffer_id];
@@ -1816,6 +1847,24 @@ void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
 
 template <class P>
 bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size) {
+    // Asking the memory tracker costs more than it seems for every buffer of every draw: when no
+    // write touched these pages since the last time, the range is still up to date.
+    // EDEN_NX2_SYNC_MEMO=0 always asks it.
+    static const bool sync_memo = [] {
+        const char* value = std::getenv("EDEN_NX2_SYNC_MEMO");
+        return value == nullptr || value[0] != '0';
+    }();
+    constexpr u32 MAX_MEMO_SIZE = 64U << WRITE_STAMP_PAGE_BITS;
+    SyncMemo* memo = nullptr;
+    u64 memo_stamp = 0;
+    if (sync_memo && size <= MAX_MEMO_SIZE) {
+        memo = &sync_memos[((device_addr >> 6) ^ (size >> 4)) & (sync_memos.size() - 1)];
+        memo_stamp = WriteStamp(device_addr, size);
+        if (memo->device_addr == device_addr && memo->size == size && memo->buffer == &buffer &&
+            memo->stamp == memo_stamp) {
+            return true;
+        }
+    }
 #ifdef __ANDROID__
     const bool use_optimized_vertex_buffers = Settings::values.use_optimized_vertex_buffers.GetValue();
 #else
@@ -1846,6 +1895,9 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
             });
             add_upload(upload_start, device_addr_out + range_size);
         });
+        if (memo != nullptr) {
+            *memo = SyncMemo{device_addr, &buffer, memo_stamp, size};
+        }
         if (total_size_bytes == 0) {
             return true;
         }
@@ -1952,6 +2004,7 @@ bool BufferCache<P>::InlineMemory(DAddr dest_address, size_t copy_size,
 template <class P>
 void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                                 std::span<const u8> inlined_buffer) {
+    NoteWrite(dest_address, copy_size);
     ClearDownload(dest_address, copy_size);
     gpu_modified_ranges.Subtract(dest_address, copy_size);
 
@@ -2090,6 +2143,8 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     if constexpr (requires { runtime.OnBufferDeleted(slot_buffers[buffer_id]); }) {
         runtime.OnBufferDeleted(slot_buffers[buffer_id]);
     }
+    read_trapped_ranges.Subtract(slot_buffers[buffer_id].CpuAddr(),
+                                 slot_buffers[buffer_id].SizeBytes());
     bool dirty_index{false};
     boost::container::small_vector<u64, NUM_VERTEX_BUFFERS> dirty_vertex_buffers;
     const auto scalar_replace = [buffer_id](Binding& binding) {
@@ -2123,6 +2178,7 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     // Mark the whole buffer as CPU written to stop tracking CPU writes
     if (!do_not_mark) {
         Buffer& buffer = slot_buffers[buffer_id];
+        NoteWrite(buffer.CpuAddr(), buffer.SizeBytes());
         memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddr(), buffer.SizeBytes());
     }
 

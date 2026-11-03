@@ -57,7 +57,9 @@ constexpr u32 NUM_VERTEX_BUFFERS = 32;
 constexpr u32 NUM_TRANSFORM_FEEDBACK_BUFFERS = 4;
 constexpr u32 NUM_GRAPHICS_UNIFORM_BUFFERS = 18;
 constexpr u32 NUM_COMPUTE_UNIFORM_BUFFERS = 8;
-constexpr u32 NUM_STORAGE_BUFFERS = 16;
+// Matches Shader::Info::MAX_SSBOS; NX2 compute shaders bind more than Maxwell's 16 (Donkey Kong
+// Bananza binds 18). The enabled/written masks are u32, so 32 is the ceiling.
+constexpr u32 NUM_STORAGE_BUFFERS = 32;
 constexpr u32 NUM_TEXTURE_BUFFERS = 32;
 constexpr u32 NUM_STAGES = 5;
 
@@ -244,6 +246,12 @@ public:
     void DownloadMemory(DAddr device_addr, u64 size);
 
     std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size);
+
+    /// Without downloads at every fence, a guest CPU read is the only way GPU-written buffer
+    /// data reaches guest memory, so reads must ask the buffer cache (GetFlushArea).
+    bool FlushesOnCpuRead() const {
+        return !AsyncBufferDownloads();
+    }
 
     bool InlineMemory(DAddr dest_address, size_t copy_size, std::span<const u8> inlined_buffer);
 
@@ -493,6 +501,39 @@ private:
 
     void ClearDownload(DAddr base_addr, u64 size);
 
+    /// Writes the buffer cache sees, by device page (hashed): a uniform buffer copy older than
+    /// the writes to its pages may be stale.
+    static constexpr u32 WRITE_STAMP_PAGE_BITS = 12;
+    static constexpr size_t NUM_WRITE_STAMPS = size_t{1} << 12;
+    std::array<u64, NUM_WRITE_STAMPS> write_stamps{};
+
+    /// Ranges SynchronizeBuffer found up to date, and the writes seen on their pages by then.
+    struct SyncMemo {
+        DAddr device_addr{};
+        const Buffer* buffer{};
+        u64 stamp{};
+        u32 size{};
+    };
+    std::array<SyncMemo, 256> sync_memos{};
+
+    void NoteWrite(DAddr device_addr, u64 size) noexcept {
+        const u64 first = device_addr >> WRITE_STAMP_PAGE_BITS;
+        const u64 pages = ((device_addr + (std::max<u64>)(size, 1) - 1) >> WRITE_STAMP_PAGE_BITS) - first + 1;
+        for (u64 i = 0; i < (std::min<u64>)(pages, NUM_WRITE_STAMPS); ++i) {
+            ++write_stamps[(first + i) & (NUM_WRITE_STAMPS - 1)];
+        }
+    }
+
+    [[nodiscard]] u64 WriteStamp(DAddr device_addr, u64 size) const noexcept {
+        const u64 first = device_addr >> WRITE_STAMP_PAGE_BITS;
+        const u64 pages = ((device_addr + (std::max<u64>)(size, 1) - 1) >> WRITE_STAMP_PAGE_BITS) - first + 1;
+        u64 stamp = 0;
+        for (u64 i = 0; i < (std::min<u64>)(pages, NUM_WRITE_STAMPS); ++i) {
+            stamp += write_stamps[(first + i) & (NUM_WRITE_STAMPS - 1)];
+        }
+        return stamp;
+    }
+
     void InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                     std::span<const u8> inlined_buffer);
 
@@ -536,6 +577,31 @@ private:
         }
         return gpu_memory == nullptr || !gpu_memory->UsesNativeTiling();
     }
+
+    /// Whether a GPU write to this range is copied back at the next fence. Ranges the guest CPU
+    /// has read (Preflushable, set by the first reactive flush) always are: later reads skip the
+    /// flush and rely on these downloads, e.g. collision meshes skinned by compute shaders.
+    bool DownloadsAtFence(DAddr device_addr, u64 size) noexcept {
+        return AsyncBufferDownloads() || memory_tracker.IsRegionPreflushable(device_addr, size);
+    }
+
+    /// GPU writes that are not downloaded at fences: trap the guest CPU's next read of their
+    /// pages, which flushes them once and marks them Preflushable (then DownloadsAtFence).
+    void ArmReadTraps(DAddr device_addr, u64 size) {
+        const DAddr begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
+        const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
+        u64 armed_bytes = 0;
+        read_trapped_ranges.ForEachInRange(begin, end - begin, [&](DAddr lower, DAddr upper) {
+            armed_bytes += upper - lower;
+        });
+        if (armed_bytes == end - begin) {
+            return;
+        }
+        read_trapped_ranges.Add(begin, end - begin);
+        device_memory.ArmReadTraps(begin, end - begin);
+    }
+
+    Common::RangeSet<DAddr> read_trapped_ranges;
     Common::RangeSet<DAddr> gpu_modified_ranges;
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
 

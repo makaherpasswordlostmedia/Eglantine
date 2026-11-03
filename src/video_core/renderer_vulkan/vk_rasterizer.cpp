@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <memory>
 #include <cstdio>
 #include <cstdlib>
@@ -13,6 +14,8 @@
 #include <set>
 #include <fstream>
 #include <mutex>
+#include <unordered_map>
+#include <utility>
 
 #include <fmt/format.h>
 
@@ -24,9 +27,12 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/dma_pusher.h"
+#include "video_core/vulkan_common/vulkan_checkpoints.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/native_query_trace.h"
+#include "video_core/nx2.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -280,6 +286,82 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         return;
     }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    // Donkey Kong Bananza's terrain: a GPU program run over points resets each rock/dirt piece's
+    // 5-word indirect draw record ({triangles 0, copies 1, 0, 0, 0}) through the pointers in a list
+    // (c0[0x110]). Stores through addresses loaded from memory can't be mapped onto a storage
+    // buffer, so the recompiler loses them and every record keeps 0 copies -- and a draw of 0
+    // copies draws nothing. Do that program's stores here instead. EDEN_NX2_RESETFIX=0 leaves it
+    // to the GPU.
+    static const bool reset_fix = [] {
+        const char* value = std::getenv("EDEN_NX2_RESETFIX");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (reset_fix && !is_indexed && maxwell3d->GetNativeMacroEngine().native_turing) {
+        // The program's 11 native instructions.
+        static constexpr std::array<u32, 44> NX2_INDIRECT_RESET_PROGRAM{
+            0xff007321, 0x0002fcff, 0x00000000, 0x000e2400, 0x00007a11, 0x00004400, 0x078018ff,
+            0x001fca00, 0xff017624, 0x00004500, 0x000e06ff, 0x000fcc00, 0x00007381, 0x00000000,
+            0x001eab00, 0x000ea200, 0x00037802, 0x00000001, 0x00000f00, 0x000fca00, 0x00007386,
+            0x00000403, 0x0010a900, 0x004fe800, 0x00007386, 0x000000ff, 0x0010a900, 0x000fe800,
+            0x00007386, 0x000008ff, 0x0010a900, 0x000fe800, 0x00007386, 0x00000cff, 0x0010a900,
+            0x000fe800, 0x00007386, 0x000010ff, 0x0010a900, 0x000fe200, 0x0000794d, 0x00000000,
+            0x03800000, 0x000fea00,
+        };
+        const auto& reset_regs = maxwell3d->regs;
+        const GPUVAddr program =
+            (u64{reset_regs.pipelines[1].reserved[0] & 0xff} << 32) | reset_regs.pipelines[1].reserved[1];
+        static std::unordered_map<GPUVAddr, bool> reset_programs;
+        auto [entry, inserted] = reset_programs.try_emplace(program, false);
+        if (inserted) {
+            std::array<u32, 44> code{};
+            const GPUVAddr code_address = program + 128;
+            if (gpu_memory->IsFullyMappedRange(code_address, sizeof(code))) {
+                gpu_memory->ReadBlockUnsafe(code_address, code.data(), sizeof(code));
+                entry->second = code == NX2_INDIRECT_RESET_PROGRAM;
+            }
+            if (entry->second) {
+                LOG_INFO(HW_GPU, "Indirect draw reset program at {:#x}: its stores are done here",
+                         program);
+            }
+        }
+        if (entry->second) {
+            const auto& reset_draw = maxwell3d->draw_manager.draw_state;
+            const auto& cbuf0 = maxwell3d->state.shader_stages[0].const_buffers[0];
+            const GPUVAddr list = gpu_memory->Read<u64>(cbuf0.address + 0x110);
+            const u32 count = (std::min)(reset_draw.vertex_buffer.count, 1u << 20);
+            const GPUVAddr list_begin = list + u64{reset_draw.vertex_buffer.first} * sizeof(u64);
+            const size_t list_bytes = size_t{count} * sizeof(u64);
+            if (count != 0 && gpu_memory->IsFullyMappedRange(list_begin, list_bytes)) {
+                if (gpu_memory->IsMemoryDirty(list_begin, list_bytes,
+                                              VideoCommon::CacheType::BufferCache)) {
+                    gpu_memory->FlushRegion(list_begin, list_bytes,
+                                            VideoCommon::CacheType::BufferCache);
+                }
+                std::vector<u64> pointers(count);
+                gpu_memory->ReadBlockUnsafe(list_begin, pointers.data(), list_bytes);
+                static constexpr std::array<u32, 5> record{0, 1, 0, 0, 0};
+                const std::span<const u8> bytes{reinterpret_cast<const u8*>(record.data()),
+                                                sizeof(record)};
+                Tegra::Nx2IndirectRecords::Get().Add(pointers);
+                u32 written = 0;
+                for (const u64 pointer : pointers) {
+                    if (pointer == 0 || !gpu_memory->IsFullyMappedRange(pointer, sizeof(record))) {
+                        continue;
+                    }
+                    AccelerateInlineToMemory(pointer, sizeof(record), bytes);
+                    ++written;
+                }
+                static u32 reset_logs{};
+                if (reset_logs < 5) {
+                    ++reset_logs;
+                    LOG_INFO(HW_GPU, "Indirect draw reset: list {:#x}, {} records ({} written)",
+                             list_begin, count, written);
+                }
+            }
+            submitted = true;
+            return;
+        }
+    }
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
     if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
@@ -425,8 +507,46 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 }
 } // Anonymous namespace
 
+void RasterizerVulkan::DrawNextFromRecord(u64 record_address) {
+    next_draw_record = record_address;
+}
+
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+    if (const u64 record = std::exchange(next_draw_record, 0); record != 0 && is_indexed &&
+        maxwell3d->draw_manager.draw_state.index_buffer.count == Tegra::Nx2RecordDrawCount) {
+        // The culling draws wrote the record and the indices in shaders, and these reads aren't
+        // shader reads: a barrier, once per run of culling draws.
+        if (culling_writes_pending) {
+            culling_writes_pending = false;
+            scheduler.RequestOutsideRenderPassOperationContext();
+            scheduler.Record([](vk::CommandBuffer cmdbuf) {
+                static constexpr VkMemoryBarrier barrier{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT,
+                };
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT |
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+                                           VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+                                       0, barrier);
+            });
+        }
+        auto& params = maxwell3d->draw_manager.indirect_state;
+        params.is_byte_count = false;
+        params.is_indexed = true;
+        params.include_count = false;
+        params.count_start_address = 0;
+        params.indirect_start_address = record;
+        params.buffer_size = 5 * sizeof(u32);
+        params.max_draw_counts = 1;
+        params.stride = 5 * sizeof(u32);
+        DrawIndirect();
+        return;
+    }
+    culling_writes_pending |= maxwell3d->regs.IsShaderConfigEnabled(size_t{4});
     TraceWindowTarget(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw",
                       is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
                                  : maxwell3d->draw_manager.draw_state.vertex_buffer.count);
@@ -536,10 +656,49 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                      regs.blend.enable[0], seen.size());
         }
     }
+    // A draw of nothing has no effect on the host, but setting it up costs as much as any other.
+    if (static const bool skip_empty = [] {
+            const char* value = std::getenv("EDEN_NX2_SKIP_EMPTY");
+            return value == nullptr || value[0] != '0';
+        }();
+        skip_empty && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+        (instance_count == 0 || (is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
+                                            : maxwell3d->draw_manager.draw_state.vertex_buffer.count) == 0)) {
+        return;
+    }
     PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
         const u32 num_instances{instance_count};
         const DrawParams draw_params{MakeDrawParams(draw_state, num_instances, is_indexed)};
+        // A count no real draw uses (garbage parameters) would keep the host GPU busy until the
+        // driver resets it: skip the draw instead.
+        if (draw_params.num_instances > (1U << 24) || draw_params.num_vertices > (1U << 28)) {
+            static std::atomic<u32> reported{};
+            const u32 count = reported.fetch_add(1);
+            if (count < 16) {
+                LOG_ERROR(Render_Vulkan, "Skipping draw with {} vertices, {} instances ({}indexed)",
+                          draw_params.num_vertices, draw_params.num_instances,
+                          draw_params.is_indexed ? "" : "not ");
+            }
+            if (count == 0) {
+                if (auto* const pusher = Tegra::DmaPusher::Current()) {
+                    pusher->DumpCurrentEntry("absurd draw");
+                }
+            }
+            return;
+        }
+        if (Vulkan::Checkpoints::DrawsEnabled()) {
+            const auto& regs = maxwell3d->regs;
+            const auto program = [&](size_t index) {
+                return (u64{regs.pipelines[index].reserved[0] & 0xff} << 32) | regs.pipelines[index].reserved[1];
+            };
+            const u64 id = Vulkan::Checkpoints::Add(draw_params.is_indexed ? "draw-indexed" : "draw",
+                                                    program(1), program(5), draw_params.num_vertices,
+                                                    draw_params.num_instances);
+            scheduler.Record([id](vk::CommandBuffer cmdbuf) {
+                cmdbuf.SetCheckpointNV(reinterpret_cast<const void*>(id));
+            });
+        }
 
         scheduler.Record([draw_params](vk::CommandBuffer cmdbuf) {
             if (draw_params.is_indexed) {
@@ -573,6 +732,20 @@ void RasterizerVulkan::DrawIndirect() {
     const auto& params = maxwell3d->draw_manager.indirect_state;
     buffer_cache.SetDrawIndirect(&params);
     PrepareDraw(params.is_indexed, [this, &params] {
+        if (params.max_draw_counts > (1U << 16)) {
+            static std::atomic<u32> reported{};
+            if (reported.fetch_add(1) < 16) {
+                LOG_ERROR(Render_Vulkan, "Indirect draw with up to {} draws (stride {}, count buffer {})",
+                          params.max_draw_counts, params.stride, params.include_count);
+            }
+        }
+        if (Vulkan::Checkpoints::DrawsEnabled()) {
+            const u64 id = Vulkan::Checkpoints::Add("draw-indirect", 0, 0,
+                                                    static_cast<u32>(params.max_draw_counts), 0);
+            scheduler.Record([id](vk::CommandBuffer cmdbuf) {
+                cmdbuf.SetCheckpointNV(reinterpret_cast<const void*>(id));
+            });
+        }
         const auto indirect_buffer = buffer_cache.GetDrawIndirectBuffer();
         const auto& buffer = indirect_buffer.first;
         const auto& offset = indirect_buffer.second;
@@ -886,6 +1059,15 @@ void RasterizerVulkan::DispatchCompute() {
     }
 
     const auto& qmd{kepler_compute->launch_description};
+    if (Vulkan::Checkpoints::Enabled()) {
+        const u64 id = Vulkan::Checkpoints::Add(
+            "dispatch", kepler_compute->regs.code_loc.Address() + qmd.program_start, 0,
+            qmd.grid_dim_x * qmd.grid_dim_y * qmd.grid_dim_z, 1);
+        scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.Record([id](vk::CommandBuffer cmdbuf) {
+            cmdbuf.SetCheckpointNV(reinterpret_cast<const void*>(id));
+        });
+    }
     auto indirect_address = kepler_compute->GetIndirectComputeAddress();
     if (indirect_address) {
         // DispatchIndirect
@@ -1002,6 +1184,13 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
     {
         std::scoped_lock lock{texture_cache.mutex};
         auto area = texture_cache.GetFlushArea(addr, size);
+        if (area) {
+            return *area;
+        }
+    }
+    if (buffer_cache.FlushesOnCpuRead()) {
+        std::scoped_lock lock{buffer_cache.mutex};
+        auto area = buffer_cache.GetFlushArea(addr, size);
         if (area) {
             return *area;
         }
@@ -1184,6 +1373,10 @@ void RasterizerVulkan::TiledCacheBarrier() {
 }
 
 void RasterizerVulkan::FlushCommands() {
+    {
+        std::scoped_lock lock{texture_cache.mutex};
+        texture_cache.NewDescriptorEpoch();
+    }
     if (draw_counter == 0) {
         return;
     }

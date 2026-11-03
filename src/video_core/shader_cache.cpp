@@ -69,6 +69,10 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
             unique_hashes[index] = 0;
             continue;
         }
+        // A native geometry program that can't be lowered is dropped instead of skipping the
+        // draw (Donkey Kong Bananza draws its ground with one).
+        const bool optional_stage =
+            native && program == Tegra::Engines::Maxwell3D::Regs::ShaderType::Geometry;
         const GPUVAddr shader_addr{native
             ? (static_cast<u64>(shader_config.reserved[0] & 0xff) << 32) | shader_config.reserved[1]
             : base_addr + shader_config.offset};
@@ -79,6 +83,10 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
             return false;
         }
         const ShaderInfo* shader_info{TryGet(*cpu_shader_addr)};
+        if (!shader_info && optional_stage && IsRejected(*cpu_shader_addr)) {
+            unique_hashes[index] = 0;
+            continue;
+        }
         if (!shader_info && native && IsRejected(*cpu_shader_addr)) {
             // A rejected program fails the same way every time it is bound: skip its draws
             // without rethrowing (two C++ throws each time cost ~1-2% of the GPU thread).
@@ -89,11 +97,12 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
         if (!shader_info) {
             const u32 start_address{native ? 0 : shader_config.offset};
             try {
-                // Native programs are lowered while the environment is built.
+                // Native programs are lowered while the environment is built (once: the
+                // ShaderInfo keeps the result for the pipeline's environments).
                 RethrowIfRejected(*cpu_shader_addr);
                 GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, native ? shader_addr : base_addr, start_address};
                 shader_info = MakeShaderInfo(env, *cpu_shader_addr);
-            } catch (const Shader::Exception&) {
+            } catch (const Shader::Exception& error) {
                 RememberRejection(*cpu_shader_addr);
                 // Once per program: which stage slot it is bound to, its header and the slot's
                 // registers (to tell how a pipeline with task/mesh programs is set up).
@@ -105,6 +114,11 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
                     std::memcpy(config.data(), &shader_config, sizeof(config));
                     LOG_ERROR(HW_GPU, "Rejected program {:#x} is bound to stage {}: header {:08x}, slot {:08x}",
                               shader_addr, index, fmt::join(header, " "), fmt::join(config, " "));
+                }
+                if (optional_stage) {
+                    LOG_WARNING(HW_GPU, "Drawing without native geometry program: {}", error.what());
+                    unique_hashes[index] = 0;
+                    continue;
                 }
                 throw;
             }
@@ -202,7 +216,8 @@ void ShaderCache::GetGraphicsEnvironments(GraphicsEnvironments& result,
         const GPUVAddr address = native
             ? (static_cast<u64>(config.reserved[0] & 0xff) << 32) | config.reserved[1]
             : base_addr;
-        env = GraphicsEnvironment{*maxwell3d, *gpu_memory, program, address, start_address};
+        env = GraphicsEnvironment{*maxwell3d, *gpu_memory, program, address, start_address,
+                                  shader_infos[index]->lowered_native};
         env.SetCachedSize(shader_infos[index]->size_bytes);
         result.env_ptrs[env_index++] = &env;
     }
@@ -342,6 +357,7 @@ const ShaderInfo* ShaderCache::MakeShaderInfo(GenericEnvironment& env, VAddr cpu
         info->unique_hash = env.CalculateHash();
         info->size_bytes = env.ReadSizeBytes();
     }
+    info->lowered_native = env.LoweredNative();
     const size_t size_bytes{env.SourceSizeBytes() ? env.SourceSizeBytes() : info->size_bytes};
     const ShaderInfo* const result{info.get()};
     Register(std::move(info), cpu_addr, size_bytes);

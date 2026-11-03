@@ -180,6 +180,11 @@ public:
     /// Logs the GPFIFO entry being processed (and the one before it), read through the GPU MMU
     /// and straight from guest memory, to find pushbuffer desyncs. Debug aid for Switch 2.
     void DumpCurrentEntry(const char* reason);
+    /// The pusher whose Step runs on this thread (for DumpCurrentEntry from the engines).
+    static DmaPusher*& Current() {
+        thread_local DmaPusher* current{};
+        return current;
+    }
     void CheckSubmitHash(const CommandListHeader& header, u64 submit_hash);
     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
 
@@ -218,7 +223,7 @@ public:
         bool increment_once;
         GPUVAddr resume_address; ///< Where the entry that continues the method starts
     };
-    void ResolveSplitMethod(GPUVAddr entry_address);
+    void ResolveSplitMethod(GPUVAddr entry_address, u64 entry_size, bool park_always);
     static constexpr size_t MaxParkedMethods = 16;
 
     // Debug aid: hashes of the words of the last entries as they were parsed.

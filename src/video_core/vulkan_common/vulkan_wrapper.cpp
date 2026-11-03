@@ -130,6 +130,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdSetDepthBias);
     X(vkCmdSetDepthBias2EXT);
     X(vkCmdSetDepthBounds);
+    X(vkCmdSetCheckpointNV);
     X(vkCmdSetEvent);
     X(vkCmdSetScissor);
     X(vkCmdSetStencilCompareMask);
@@ -231,6 +232,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkGetSemaphoreCounterValue);
     X(vkMapMemory);
     X(vkQueueBindSparse);
+    X(vkGetQueueCheckpointDataNV);
     X(vkQueueSubmit);
     X(vkQueueSubmit2);
     X(vkResetFences);

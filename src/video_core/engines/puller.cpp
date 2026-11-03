@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <utility>
 
 #include "common/assert.h"
 #include "common/logging.h"
@@ -171,6 +172,9 @@ void Puller::ProcessBindMethod(DmaPusher& dma_pusher, const MethodCall& method_c
         break;
     default:
         UNIMPLEMENTED_MSG("Unimplemented engine {:04X}", engine_id);
+        if (static bool dumped{}; !std::exchange(dumped, true)) {
+            dma_pusher.DumpCurrentEntry("unknown engine");
+        }
         break;
     }
 }

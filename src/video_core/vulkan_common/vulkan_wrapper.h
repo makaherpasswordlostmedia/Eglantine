@@ -264,6 +264,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdSetDepthBiasEnableEXT vkCmdSetDepthBiasEnableEXT{};
     PFN_vkCmdSetLogicOpEnableEXT vkCmdSetLogicOpEnableEXT{};
     PFN_vkCmdSetDepthClampEnableEXT vkCmdSetDepthClampEnableEXT{};
+    PFN_vkCmdSetCheckpointNV vkCmdSetCheckpointNV{};
     PFN_vkCmdSetEvent vkCmdSetEvent{};
     PFN_vkCmdSetFrontFaceEXT vkCmdSetFrontFaceEXT{};
     PFN_vkCmdSetPatchControlPointsEXT vkCmdSetPatchControlPointsEXT{};
@@ -347,6 +348,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkGetSemaphoreCounterValue vkGetSemaphoreCounterValue{};
     PFN_vkMapMemory vkMapMemory{};
     PFN_vkQueueBindSparse vkQueueBindSparse{};
+    PFN_vkGetQueueCheckpointDataNV vkGetQueueCheckpointDataNV{};
     PFN_vkQueueSubmit vkQueueSubmit{};
     PFN_vkQueueSubmit2 vkQueueSubmit2{};
     PFN_vkResetFences vkResetFences{};
@@ -870,6 +872,19 @@ public:
 
     VkResult Present(const VkPresentInfoKHR& present_info) const noexcept {
         return dld->vkQueuePresentKHR(queue, &present_info);
+    }
+
+    /// The last VK_NV_device_diagnostic_checkpoints markers the queue reached, if supported.
+    std::vector<VkCheckpointDataNV> GetCheckpointData() const {
+        std::vector<VkCheckpointDataNV> data;
+        if (dld->vkGetQueueCheckpointDataNV) {
+            u32 count = 0;
+            dld->vkGetQueueCheckpointDataNV(queue, &count, nullptr);
+            data.resize(count, VkCheckpointDataNV{.sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
+            dld->vkGetQueueCheckpointDataNV(queue, &count, data.data());
+            data.resize(count);
+        }
+        return data;
     }
 
 private:
@@ -1570,6 +1585,12 @@ public:
 
     void SetDepthBounds(float min_depth_bounds, float max_depth_bounds) const noexcept {
         dld->vkCmdSetDepthBounds(handle, min_depth_bounds, max_depth_bounds);
+    }
+
+    void SetCheckpointNV(const void* marker) const noexcept {
+        if (dld->vkCmdSetCheckpointNV) {
+            dld->vkCmdSetCheckpointNV(handle, marker);
+        }
     }
 
     void SetEvent(VkEvent event, VkPipelineStageFlags stage_flags) const noexcept {

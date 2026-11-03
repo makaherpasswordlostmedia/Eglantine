@@ -3174,6 +3174,8 @@ public:
                          u32 argument, bool is_last_call);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending);
+    /// Pushbuffer address of the words passed to the front methods above.
+    GPUVAddr front_segment{};
 
     bool ShouldExecute() const {
         return execute_on;

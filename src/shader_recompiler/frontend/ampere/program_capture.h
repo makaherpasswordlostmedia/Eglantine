@@ -32,6 +32,13 @@ public:
             if (opcode == 0x947 && computed_branch && instruction.Bits(12, 4) == 7 &&
                 target == s64{index} * 16)
                 return Result::Complete;
+            // It also ends programs whose RET pairs with a CALL.REL.NOINC (the return address
+            // passed in a register), which the EXIT/RET rules below can't see. Only used when
+            // the capture runs into an invalid branch past it (see FallbackEnd).
+            if (opcode == 0x947 && instruction.Bits(12, 4) == 7 && instruction.Bits(87, 4) == 7 &&
+                target == s64{index} * 16 && index >= last_forward_target && index >= last_call_target &&
+                !fallback_end)
+                fallback_end = index + 1;
         }
         if (opcode == 0x949 || opcode == 0x958) computed_branch = true;
         if (computed_branch) return Result::Continue;
@@ -45,7 +52,13 @@ public:
         return Result::Continue;
     }
 
+    /// Instruction count up to the first closing self-branch, or 0 if none was seen.
+    u32 FallbackEnd() const {
+        return fallback_end;
+    }
+
 private:
+    u32 fallback_end{};
     u32 last_call_target{};
     u32 last_forward_target{};
     bool main_exited{};

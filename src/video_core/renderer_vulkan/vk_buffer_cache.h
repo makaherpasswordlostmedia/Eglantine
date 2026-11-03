@@ -165,7 +165,35 @@ public:
         const StagingBufferRef ref = staging_pool.Request(size, MemoryUsage::Upload);
         guest_descriptor_queue.AddBuffer(ref.buffer, ref.device_address,
                                          static_cast<u32>(ref.offset), size);
+        last_mapped_uniform = ref;
         return ref.mapped_span;
+    }
+
+    /// Binds the copy this submission already holds of a small uniform buffer, if no write since
+    /// (stamp) could have changed it. False: it has to be copied again.
+    [[nodiscard]] bool RebindMappedUniformBuffer(size_t stage, u32 index, u64 device_addr, u32 size,
+                                                 u64 stamp) {
+        const MappedUniformCopy& copy = mapped_uniform_copies[stage][index];
+        if (copy.device_addr != device_addr || copy.size != size || copy.stamp != stamp ||
+            copy.tick != CurrentTick()) {
+            return false;
+        }
+        guest_descriptor_queue.AddBuffer(copy.buffer, copy.device_address, copy.offset, size);
+        return true;
+    }
+
+    /// The copy BindMappedUniformBuffer just made holds this uniform buffer.
+    void RememberMappedUniformBuffer(size_t stage, u32 index, u64 device_addr, u32 size,
+                                     u64 stamp) {
+        mapped_uniform_copies[stage][index] = MappedUniformCopy{
+            .device_addr = device_addr,
+            .stamp = stamp,
+            .tick = CurrentTick(),
+            .buffer = last_mapped_uniform.buffer,
+            .device_address = last_mapped_uniform.device_address,
+            .offset = static_cast<u32>(last_mapped_uniform.offset),
+            .size = size,
+        };
     }
 
     [[nodiscard]] VkDeviceSize SparseAlignmentFor(bool sparse_compatible) const noexcept {
@@ -247,11 +275,26 @@ private:
     void ReserveNullBuffer();
     vk::Buffer CreateNullBuffer();
 
+    struct MappedUniformCopy {
+        u64 device_addr{};
+        u64 stamp{};
+        u64 tick{};
+        VkBuffer buffer{};
+        VkDeviceAddress device_address{};
+        u32 offset{};
+        u32 size{};
+    };
+
     const Device& device;
     MemoryAllocator& memory_allocator;
     Scheduler& scheduler;
     StagingBufferPool& staging_pool;
     GuestDescriptorQueue& guest_descriptor_queue;
+
+    StagingBufferRef last_mapped_uniform{};
+    std::array<std::array<MappedUniformCopy, VideoCommon::NUM_GRAPHICS_UNIFORM_BUFFERS>,
+               VideoCommon::NUM_STAGES>
+        mapped_uniform_copies{};
 
     std::shared_ptr<QuadArrayIndexBuffer> quad_array_index_buffer;
     std::shared_ptr<QuadStripIndexBuffer> quad_strip_index_buffer;

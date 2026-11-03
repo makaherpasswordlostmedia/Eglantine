@@ -6,9 +6,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <fmt/ranges.h>
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/scope_exit.h"
@@ -795,6 +797,7 @@ struct Maxwell3D::FrontState {
     Regs::ShadowRamControl control{};
     u32 executing_macro{};
     std::vector<u32> parameters;
+    std::vector<std::pair<GPUVAddr, u32>> parameter_segments; ///< Where `parameters` came from
     std::vector<u32> fifo;
     u64 calls{};
     /// A method the draw manager handles was sent since the back last ran DrawDeferred: only
@@ -958,6 +961,7 @@ void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& spl
             fs.executing_macro = method;
         }
         fs.parameters.push_back(argument);
+        fs.parameter_segments.emplace_back(front_segment, 1);
         if (is_last_call) {
             FrontRunMacro(system, split, fs);
         }
@@ -975,6 +979,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
             fs.executing_macro = method;
         }
         fs.parameters.insert(fs.parameters.end(), base_start, base_start + amount);
+        fs.parameter_segments.emplace_back(front_segment, amount);
         if (amount == methods_pending) {
             FrontRunMacro(system, split, fs);
         }
@@ -1071,9 +1076,20 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         }
         engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
         fs.fifo.assign(fs.parameters.begin(), fs.parameters.end());
+        // Registers this call read, to compare with the back's once it fails.
+        std::array<u32, 32> read_addresses;
+        u32 read_count = 0;
+        const auto data_ram_before = native_data_ram;
         const auto result = engine.native_jit->Execute(
             start, fs.fifo, std::span<u32>{native_data_ram},
-            [&fs](u32 address) { return address < Regs::NUM_REGS ? fs.regs[address] : 0U; },
+            [&](u32 address) {
+                if (read_count < read_addresses.size() &&
+                    std::find(read_addresses.begin(), read_addresses.begin() + read_count, address) ==
+                        read_addresses.begin() + read_count) {
+                    read_addresses[read_count++] = address;
+                }
+                return address < Regs::NUM_REGS ? fs.regs[address] : 0U;
+            },
             [&](u32 address, u32 value) {
                 if (address >= MacroRegistersStart) {
                     return false;
@@ -1089,9 +1105,44 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             engine.native_execution_failed = true;
             LOG_ERROR(HW_GPU, "Native MME (JIT, split front) failed: start={:#x}, consumed={}/{}, error={}",
                       start, result.consumed, fs.parameters.size(), result.error);
+            static u32 described{};
+            if (described < 4) {
+                ++described;
+                // What the front read against what the back holds once it caught up.
+                split.Drain();
+                LOG_ERROR(HW_GPU, "  parameters: {:08x}", fmt::join(fs.parameters, " "));
+                for (const auto& [address, count] : fs.parameter_segments) {
+                    std::array<u32, 8> now{};
+                    const bool gpu_dirty = memory_manager.IsMemoryDirty(address, count * sizeof(u32), VideoCommon::CacheType::BufferCache);
+                    if (gpu_dirty) memory_manager.FlushRegion(address, count * sizeof(u32), VideoCommon::CacheType::BufferCache);
+                    memory_manager.ReadBlockUnsafe(address, now.data(), std::min<u32>(count, 8) * sizeof(u32));
+                    LOG_ERROR(HW_GPU, "  from {:#x} x{}{}, memory now {:08x}", address, count, gpu_dirty ? " (GPU-dirty)" : "", fmt::join(now, " "));
+                }
+                for (u32 i = 0; i < read_count; ++i) {
+                    const u32 address = read_addresses[i];
+                    const u32 back = address < Regs::NUM_REGS ? regs.reg_array[address] : 0U;
+                    const u32 shadow = address < Regs::NUM_REGS ? shadow_state.reg_array[address] : 0U;
+                    LOG_ERROR(HW_GPU, "  read {:#05x}: front {:#010x} back {:#010x} shadow {:#010x}{}",
+                              address, address < Regs::NUM_REGS ? fs.regs[address] : 0U, back, shadow,
+                              address < Regs::NUM_REGS && fs.regs[address] != back ? "  <-- differs" : "");
+                }
+                const auto path = fmt::format("mme-fail-{}.bin", described);
+                if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+                    // u32 start, u32 parameter count, parameters, data RAM before, macro code
+                    const u32 count = static_cast<u32>(fs.parameters.size());
+                    std::fwrite(&start, sizeof(start), 1, file);
+                    std::fwrite(&count, sizeof(count), 1, file);
+                    std::fwrite(fs.parameters.data(), sizeof(u32), count, file);
+                    std::fwrite(data_ram_before.data(), sizeof(u32), data_ram_before.size(), file);
+                    std::fwrite(engine.native_code.data(), sizeof(u32), engine.native_code.size(), file);
+                    std::fclose(file);
+                    LOG_ERROR(HW_GPU, "  macro state written to {}", path);
+                }
+            }
         }
     }
     fs.parameters.clear();
+    fs.parameter_segments.clear();
     if (fs.draw_pending) {
         fs.draw_pending = false;
         split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); });
@@ -1102,6 +1153,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
 #else
     fs.executing_macro = 0;
     fs.parameters.clear();
+    fs.parameter_segments.clear();
 #endif
 }
 

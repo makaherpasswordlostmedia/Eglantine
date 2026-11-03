@@ -48,6 +48,9 @@ public:
     /// Dispatches an indirect draw invocation
     virtual void DrawIndirect() {}
 
+    /// The next draw, if its index count is Tegra::Nx2RecordDrawCount, reads this indirect record
+    virtual void DrawNextFromRecord([[maybe_unused]] u64 record_address) {}
+
     /// Dispatches an draw texture invocation
     virtual void DrawTexture() = 0;
 

@@ -88,6 +88,7 @@ public:
 
     void Draw(bool is_indexed, u32 instance_count) override;
     void DrawIndirect() override;
+    void DrawNextFromRecord(u64 record_address) override;
     void DrawTexture() override;
     void Clear(u32 layer_count) override;
     void DispatchCompute() override;
@@ -224,6 +225,8 @@ private:
     FenceManager fence_manager;
 
     vk::Event wfi_event;
+    u64 next_draw_record{};
+    bool culling_writes_pending{};
 
     boost::container::static_vector<u32, MAX_IMAGE_VIEWS> image_view_indices;
     std::array<VideoCommon::ImageViewId, MAX_IMAGE_VIEWS> image_view_ids;
