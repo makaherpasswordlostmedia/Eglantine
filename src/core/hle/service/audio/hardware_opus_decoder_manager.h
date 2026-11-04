@@ -25,6 +25,8 @@ public:
     ~IHardwareOpusDecoderManager() override;
 
 private:
+    void Nx2GetUserClient(HLERequestContext& ctx);
+
     Result OpenHardwareOpusDecoder(Out<SharedPointer<IHardwareOpusDecoder>> out_decoder,
                                    OpusParameters params, u32 tmem_size,
                                    InCopyHandle<Kernel::KTransferMemory> tmem_handle);

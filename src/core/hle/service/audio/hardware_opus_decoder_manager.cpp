@@ -7,6 +7,7 @@
 #include "core/hle/service/audio/hardware_opus_decoder.h"
 #include "core/hle/service/audio/hardware_opus_decoder_manager.h"
 #include "core/hle/service/cmif_serialization.h"
+#include "core/hle/service/ipc_helpers.h"
 
 namespace Service::Audio {
 
@@ -26,12 +27,27 @@ IHardwareOpusDecoderManager::IHardwareOpusDecoderManager(Core::System& system_)
         {7, D<&IHardwareOpusDecoderManager::GetWorkBufferSizeForMultiStreamEx>, "GetWorkBufferSizeForMultiStreamEx"},
         {8, D<&IHardwareOpusDecoderManager::GetWorkBufferSizeExEx>, "GetWorkBufferSizeExEx"},
         {9, D<&IHardwareOpusDecoderManager::GetWorkBufferSizeForMultiStreamExEx>, "GetWorkBufferSizeForMultiStreamExEx"},
+        // Switch 2: the SDK opens hwopus with command 100 before any Switch 1 style call and
+        // expects an interface back (the same pattern as aud:u command 2).
+        {100, &IHardwareOpusDecoderManager::Nx2GetUserClient, "Nx2GetUserClient (guessed)"},
     };
     // clang-format on
     RegisterHandlers(functions);
 }
 
 IHardwareOpusDecoderManager::~IHardwareOpusDecoderManager() = default;
+
+// Auto-stubbed, this command returns success without an object. The game then dereferences a
+// garbage object id ("object_id ... is too big!") and panics, leaving the emulator on an endless
+// loading screen. Hand back this same manager (not a new one: every HardwareOpus instance
+// re-registers the shared ADSP opus memory, so a second instance would break the first).
+void IHardwareOpusDecoderManager::Nx2GetUserClient(HLERequestContext& ctx) {
+    LOG_WARNING(Service_Audio, "(STUBBED) Switch 2 hwopus 100, returning IHardwareOpusDecoderManager");
+    IPC::ResponseBuilder rb{ctx, 2, 0, 1};
+    rb.Push(ResultSuccess);
+    rb.PushIpcInterface<IHardwareOpusDecoderManager>(
+        ctx, std::static_pointer_cast<IHardwareOpusDecoderManager>(shared_from_this()));
+}
 
 Result IHardwareOpusDecoderManager::OpenHardwareOpusDecoder(
     Out<SharedPointer<IHardwareOpusDecoder>> out_decoder, OpusParameters params, u32 tmem_size,
