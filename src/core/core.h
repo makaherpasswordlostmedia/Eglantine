@@ -119,6 +119,9 @@ namespace Core {
 /// Frames the guest has presented (Switch 2 vi2 present calls); input replay is locked to it.
 extern std::atomic<u64> g_nx2_present_count;
 
+/// Diagnostic: number of SVCs still to be logged after the Switch 2 hwopus command 10.
+extern std::atomic<u32> g_nx2_hwopus_svc_trace;
+
 class CpuManager;
 class Debugger;
 class DeviceMemory;

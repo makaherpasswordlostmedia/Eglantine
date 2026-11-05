@@ -2524,6 +2524,16 @@ void Call(Core::System& system, u32 imm) {
                  GetCurrentThread(kernel).GetThreadId(),
                  GetArg64(args, 0), GetArg64(args, 1), GetArg64(args, 2), GetArg64(args, 3));
     }
+    {
+        u32 left = Core::g_nx2_hwopus_svc_trace.load(std::memory_order_relaxed);
+        while (left > 0 && !Core::g_nx2_hwopus_svc_trace.compare_exchange_weak(left, left - 1)) {
+        }
+        if (left > 0) {
+            LOG_INFO(Kernel_SVC, "hwopus-trace svc {:#04x} t{} [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x}",
+                     imm, GetCurrentThread(kernel).GetThreadId(), GetArg64(args, 0),
+                     GetArg64(args, 1), GetArg64(args, 2), GetArg64(args, 3));
+        }
+    }
     if (imm == 0x7d) {
         auto* const arm = process.GetArmInterface(kernel.CurrentPhysicalCoreIndex());
         Svc::ThreadContext ctx{};

@@ -106,6 +106,13 @@ void ServiceFrameworkBase::ReportUnimplementedFunction(HLERequestContext& ctx,
         fmt::format_to(std::back_inserter(buf), ", [{}]={:#x}", i, cmd_buf[i]);
     buf.push_back('}');
 
+    if (name_view.starts_with("nx2:hwopus") && ctx.GetCommand() == 10) {
+        // Diagnostic: the game hangs after this call; log what it does next.
+        LOG_WARNING(Service, "hwopus command 10 on thread {}, tracing the next 3000 SVCs",
+                    Kernel::GetCurrentThread(system.Kernel()).GetThreadId());
+        Core::g_nx2_hwopus_svc_trace.store(3000, std::memory_order_relaxed);
+    }
+
     system.GetReporter().SaveUnimplementedFunctionReport(ctx, ctx.GetCommand(), function_name, service_name);
     UNIMPLEMENTED_MSG("Unknown / unimplemented {}", fmt::to_string(buf));
     if (auto_stub) {
